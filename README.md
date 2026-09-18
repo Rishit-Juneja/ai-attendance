@@ -66,6 +66,13 @@ headless batch runner.
 is what lets a distant face clear the threshold — measured on a 24px face, a
 1-photo entry scored 0.2663 (miss) against 0.3044 for a 2-photo entry.
 
+**Zones.** Draw a polygon on the live feed ("Attendance zone" on the Live page)
+and only faces standing inside it count — useful when a corridor or doorway is
+visible in shot. With no zone defined the whole frame counts, so this is opt-in.
+Points are stored normalized 0..1 in `data/zones.json`, so a zone stays correct
+if the camera resolution changes. A zone is an *area*, not a tripwire: it answers
+"who is in the room", not "who crossed this line, which way".
+
 ### 4. Generate Reports
 
 Reports are auto-generated on shutdown. Manual:
@@ -87,7 +94,13 @@ Switch via `--gpu-profile` or `GPU_PROFILE=dev` env var.
 
 ## Key Design Decisions
 
-1. **ByteTrack over DeepSORT**: ByteTrack is simpler, faster, and handles occlusion better for our use case. We only re-embed tracks that have been inactive for N frames, not every detection.
+1. **ByteTrack over DeepSORT**: via the `trackers` package — Kalman motion
+   prediction plus the two-stage high/low-confidence association BYTE is named
+   for. `ByteTrackWrapper` in pipeline.py adds a rolling embedding average per
+   track on top, which is what lets a small CCTV face clear the match threshold
+   (0.28 → 0.46 measured on a 25px face). Activation thresholds are set below the
+   library defaults on purpose: SCRFD scores a sub-25px face at a median 0.685,
+   so the stock 0.7 would refuse to track 26% of real faces.
 
 2. **FAISS in-memory**: 500 faces × 512 dimensions = ~1MB. No vector DB needed.
 
@@ -138,9 +151,13 @@ ai-attendance/
   that faces fall under ~25px and scores collapse into the impostor range.
 - Anti-spoofing via motion heuristic is basic — it catches a still printed photo
   and nothing else; a video on a phone screen passes. `SilentFaceLiveness` in
-  antispoof.py is a stub waiting for the Silent-Face ONNX model.
-- **The spoof flag does not block attendance.** `is_spoof` only colours the box
-  red in main.py; attendance.py never reads it.
+  antispoof.py is a stub waiting for the Silent-Face ONNX model. The flag now
+  does block attendance (a spoofed face is never marked present), so the weak
+  part is the detection, not the consequence.
+- Alert *categories* are still the original guesses. The flooding is fixed —
+  repeats collapse into one row per subject with a count — but whether
+  `face_hiding` (fires when a known person leaves frame for 10s+) is worth having
+  at all has not been decided.
 - The 29 auto-enrolled CASIA entries are embedded without landmark alignment
   (`DirectArcFaceEmbedder`), so they are excluded from live matching via
   `GalleryMatcher(live_only=True)`. Mixing them in makes aligned queries collapse

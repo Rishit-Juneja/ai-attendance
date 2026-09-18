@@ -14,6 +14,7 @@ Run:
 import argparse
 import base64
 import json
+import os
 import tempfile
 import threading
 import time
@@ -36,8 +37,9 @@ from .config import (
     STATIC_DIR,
     TEMPLATES_DIR,
 )
-from .pipeline import ArcFaceEmbedder, ByteTrackWrapper, Pipeline
+from .pipeline import ArcFaceEmbedder, Pipeline
 from .reports import generate_daily_csv, generate_daily_pdf
+from .zones import Zone, draw_zones, load_zones, save_zones
 
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR), static_folder=str(STATIC_DIR))
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB upload cap
@@ -509,9 +511,9 @@ def api_gallery_remove(roll):
 @app.route("/api/live/start", methods=["POST"])
 def api_live_start():
     global _logger, _spoof_checker
-    _logger = AttendanceLogger(session_name=f"live_{datetime.now():%Y%m%d_%H%M%S}")
+    _logger = AttendanceLogger(session_name=f"live_{datetime.now():%Y%m%d_%H%M%S}", config=_config)
     pipeline = get_pipeline()
-    pipeline.tracker = ByteTrackWrapper(max_age=30, min_hits=2)
+    pipeline.reset_tracker()
     _spoof_checker = SpoofChecker(
         movement_threshold=_config.spoof_pixel_movement_thresh,
         flag_after_n=_config.spoof_frame_count,
@@ -531,7 +533,7 @@ def api_live_frame():
         return jsonify({"ok": False, "error": "Could not decode frame."}), 400
 
     if _logger is None:
-        _logger = AttendanceLogger(session_name=f"live_{datetime.now():%Y%m%d_%H%M%S}")
+        _logger = AttendanceLogger(session_name=f"live_{datetime.now():%Y%m%d_%H%M%S}", config=_config)
 
     pipeline = get_pipeline()
     result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
@@ -569,7 +571,12 @@ _stream_lock = threading.Lock()
 def _stream_worker(url: str):
     """Pull frames, run the pipeline, keep the latest annotated frame for the feed."""
     global _logger
+    if url.startswith("rtsp"):
+        # OpenCV/FFmpeg default RTSP to UDP, which drops packets and smears
+        # macroblocks across faces on a shared LAN. TCP costs nothing here.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
     cap = cv2.VideoCapture(url)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency at one frame, not a backlog
     # Don't let a dead camera wedge the worker forever.
     cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
     cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
@@ -581,6 +588,7 @@ def _stream_worker(url: str):
     _stream["cap"] = cap
     pipeline = get_pipeline()
     misses = 0
+    last_dets = []
     while _stream["run"]:
         ok, frame = cap.read()
         if not ok:
@@ -594,21 +602,64 @@ def _stream_worker(url: str):
         # Throttle analysis to the profile's fps; the feed still shows every frame.
         if pipeline.should_analyze():
             result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
+            last_dets = result.detections
             if _logger is not None:
                 _logger.process_detections(result.detections, result.frame_idx, result.timestamp)
-            for d in result.detections:
-                x1, y1, x2, y2 = d.bbox.astype(int)
-                known = d.name != "Unknown"
-                color = (0, 0, 255) if d.is_spoof else ((0, 200, 0) if known else (140, 140, 140))
-                label = f"{d.name} {d.match_score:.2f}" if known else f"#{d.track_id} {d.match_score:.2f}"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, max(12, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # Drawn on EVERY frame, not just analysed ones. Publishing un-annotated
+        # frames in between is what made the box strobe: the overlay vanished on
+        # any frame that skipped analysis. Boxes go stale by at most one frame
+        # interval, which is invisible; a flashing box is not.
+        draw_zones(frame, pipeline.zones)
+        for d in last_dets:
+            x1, y1, x2, y2 = d.bbox.astype(int)
+            known = d.name != "Unknown"
+            color = (0, 0, 255) if d.is_spoof else ((0, 200, 0) if known else (140, 140, 140))
+            label = f"{d.name} {d.match_score:.2f}" if known else f"#{d.track_id} {d.match_score:.2f}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, label, (x1, max(12, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         with _stream_lock:
             _stream["frame"] = frame
     cap.release()
     _stream["cap"] = None
     _stream["run"] = False
+
+
+@app.route("/api/zones", methods=["GET", "POST"])
+def api_zones():
+    """
+    Polygon zones in normalized 0..1 coordinates. Attendance counts only faces
+    standing inside one; no zones at all means the whole frame counts.
+    """
+    if request.method == "GET":
+        return jsonify({"ok": True, "zones": [
+            {"name": z.name, "points": z.points} for z in load_zones()]})
+
+    payload = (request.get_json(silent=True) or {}).get("zones", [])
+    zones = []
+    for z in payload:
+        name = str(z.get("name", "")).strip()
+        pts = z.get("points", [])
+        if not name:
+            return jsonify({"ok": False, "error": "Every zone needs a name."}), 400
+        if len(pts) < 3:
+            return jsonify({"ok": False,
+                            "error": f"'{name}' has {len(pts)} points; a zone needs at least 3."}), 400
+        # Reject out-of-range coords rather than storing a zone that silently
+        # sits off-frame and matches nobody.
+        for x, y in pts:
+            if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
+                return jsonify({"ok": False,
+                                "error": f"'{name}' has a point outside the frame."}), 400
+        zones.append(Zone(name=name, points=[[float(x), float(y)] for x, y in pts]))
+
+    save_zones(zones)
+    # The pipeline is a singleton built once, so it would keep the old polygons
+    # until a restart otherwise.
+    if _pipeline is not None:
+        _pipeline.zones = zones
+    return jsonify({"ok": True, "saved": len(zones)})
 
 
 @app.route("/api/live/stream_start", methods=["POST"])
@@ -617,16 +668,25 @@ def api_live_stream_start():
     url = (request.get_json(silent=True) or {}).get("url", "").strip()
     if not url:
         return jsonify({"ok": False, "error": "A camera URL is required."}), 400
-    if _stream["run"]:
-        return jsonify({"ok": False, "error": "A stream is already running."}), 400
 
     # IP Webcam-style apps serve the stream at /video; accept the bare host too.
+    # Normalize before the running-check so the same camera compares equal.
     if url.startswith("http") and not any(url.rstrip("/").endswith(s) for s in ("/video", ".mjpg", ".mjpeg", "/videofeed")):
         url = url.rstrip("/") + "/video"
 
-    _logger = AttendanceLogger(session_name=f"cam_{datetime.now():%Y%m%d_%H%M%S}")
+    if _stream["run"]:
+        # Reconnecting to the camera already playing is what someone means when
+        # they hit Connect after a refresh. Refusing left them wedged until the
+        # server restarted, with a live feed they couldn't attach to.
+        if _stream["url"] == url:
+            return jsonify({"ok": True, "url": url, "reattached": True,
+                            "session": _logger.session_name if _logger else ""})
+        return jsonify({"ok": False,
+                        "error": f"Already streaming {_stream['url']}. Stop it first."}), 400
+
+    _logger = AttendanceLogger(session_name=f"cam_{datetime.now():%Y%m%d_%H%M%S}", config=_config)
     pipeline = get_pipeline()
-    pipeline.tracker = ByteTrackWrapper(max_age=30, min_hits=2, embed_window=_config.track_embed_window)
+    pipeline.reset_tracker()
     _spoof_checker = SpoofChecker(
         movement_threshold=_config.spoof_pixel_movement_thresh,
         flag_after_n=_config.spoof_frame_count,

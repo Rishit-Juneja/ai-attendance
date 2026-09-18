@@ -6,7 +6,12 @@ insightface>=0.7.3
 opencv-python-headless>=4.8.0
 faiss-cpu>=1.8.0          # gallery is ~30x512 floats; GPU faiss buys nothing here
 numpy>=1.24.0
-scipy>=1.11.0
+# Real ByteTrack: Kalman prediction + the two-stage association BYTE is named
+# for. Pulls supervision, whose Detections container the tracker takes/returns.
+# (supervision's own sv.ByteTrack is deprecated, removed in 0.31 — this is the
+# maintained replacement.) scipy went with it: its only use here was the
+# Hungarian assignment in the hand-rolled tracker this replaced.
+trackers>=2.6.0
 Pillow>=10.0.0
 tqdm>=4.65.0
 websockets>=12.0

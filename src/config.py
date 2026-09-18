@@ -37,7 +37,15 @@ class GPUProfile:
 PROFILES = {
     "dev": GPUProfile(
         name="dev",
-        analysis_fps=3,
+        # Measured on an RTX 5060: detect+embed is 7.4ms/frame (135 fps ceiling),
+        # so match the camera instead of throttling. This is a tracking setting as
+        # much as a speed one — ByteTrack associates by IoU, and at 3 fps a walking
+        # person's box clears its own width between frames, so overlap hits zero
+        # and every frame spawns a new track ID.
+        # Set above the 15fps camera on purpose: should_analyze() gates on a
+        # wall-clock interval, so an exactly-matched rate drops every other frame
+        # on timing jitter. Overshooting means the gate never falsely skips.
+        analysis_fps=20,
         det_size=(640, 640),
         det_batch=4,
         emb_batch=32,

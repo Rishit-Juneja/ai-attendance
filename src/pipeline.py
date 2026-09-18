@@ -9,9 +9,12 @@ from dataclasses import dataclass, field
 import cv2
 import faiss
 import numpy as np
+import supervision as sv
 from insightface.app import FaceAnalysis
+from trackers import ByteTrackTracker
 
 from .config import Config, GPUProfile
+from .zones import load_zones, zone_for
 
 
 @dataclass
@@ -25,6 +28,7 @@ class Detection:
     is_spoof: bool = False
     liveness_score: float = 1.0
     observations: int = 0     # frames averaged into this track's embedding; higher = more confident
+    zone: str = ""            # named zone containing this face, "" if none defined
 
 
 @dataclass
@@ -39,7 +43,7 @@ class FrameResult:
 class ArcFaceEmbedder:
     """Wraps InsightFace for detection + embedding."""
 
-    def __init__(self, det_size=(640, 640), use_half=False, providers=None):
+    def __init__(self, det_size=(640, 640), use_half=False, providers=None, det_thresh=0.4):
         import onnxruntime as ort
         available = ort.get_available_providers()
         if providers:
@@ -52,7 +56,12 @@ class ArcFaceEmbedder:
             name="buffalo_l",
             providers=provider_list,
         )
-        self.model.prepare(ctx_id=0, det_size=det_size)
+        # Below InsightFace's 0.5 default on purpose: ByteTrack's second association
+        # stage needs low-confidence boxes to rescue occluded tracks, and at 0.5
+        # SCRFD never emits any (measured floor: 0.505). Dropping to 0.4 left pic1
+        # and pic3 unchanged at 12/35 faces and only added boxes in a dense crowd,
+        # so this buys the low bucket without flooding normal scenes with junk.
+        self.model.prepare(ctx_id=0, det_thresh=det_thresh, det_size=det_size)
         self.det_model = self.model.det_model
 
         # get_available_providers() lists CUDA even when its libs fail to load at
@@ -131,18 +140,33 @@ class GalleryMatcher:
 
 class ByteTrackWrapper:
     """
-    Lightweight ByteTrack implementation using scipy's linear_sum_assignment.
-    Maintains persistent IDs across frames.
+    Real ByteTrack (trackers.ByteTrackTracker) plus our per-track embedding window.
+
+    The library owns association — Kalman motion prediction and the two-stage
+    high/low-confidence matching that BYTE is actually named for. We own the
+    rolling embedding average, which is what lets a small CCTV face clear the
+    match threshold (measured 0.28 -> 0.46 on a 25px face).
+
+    Thresholds sit below the library defaults deliberately. Measured on this
+    project's own crowd photos, SCRFD scores a sub-25px face at a median 0.685
+    with a floor of 0.505, so the stock track_activation_threshold of 0.7 refuses
+    to track 26% of real faces — and they are precisely the distant ones this
+    system exists to identify.
     """
 
-    def __init__(self, max_age=30, min_hits=3, iou_threshold=0.3, embed_window=30):
+    def __init__(self, max_age=30, min_hits=2, embed_window=30, frame_rate=15.0):
         self.max_age = max_age
-        self.min_hits = min_hits
-        self.iou_threshold = iou_threshold
         self.embed_window = embed_window
-        self.tracks: dict[int, _Track] = {}
-        self._next_id = 1
+        self.tracks: dict[int, ByteTrackWrapper._Track] = {}
         self.frame_count = 0
+        self._tracker = ByteTrackTracker(
+            lost_track_buffer=max_age,
+            frame_rate=frame_rate,
+            minimum_consecutive_frames=min_hits,
+            track_activation_threshold=0.5,
+            high_conf_det_threshold=0.5,
+            minimum_iou_threshold=0.1,
+        )
 
     class _Track:
         """
@@ -156,6 +180,9 @@ class ByteTrackWrapper:
         to a different person, the old identity rolls off instead of poisoning the
         average forever.
         """
+
+        __slots__ = ("id", "bbox", "_embeddings", "age", "hits",
+                     "time_since_update", "name", "roll", "last_embed_frame")
 
         def __init__(self, tid, bbox, embedding=None, window=30):
             self.id = tid
@@ -187,65 +214,64 @@ class ByteTrackWrapper:
             """How many frames back this identity. More = more trustworthy."""
             return len(self._embeddings)
 
-    def update(self, detections: list[np.ndarray], embeddings: list[np.ndarray | None] | None = None) -> list[_Track]:
+    def update(
+        self,
+        detections: list[np.ndarray],
+        embeddings: list[np.ndarray | None] | None = None,
+        scores: list[float] | None = None,
+    ) -> list[_Track]:
         """
         detections: list of [x1,y1,x2,y2] arrays
         embeddings: parallel list of embeddings (or None if not computed yet)
+        scores:     parallel list of SCRFD confidences. ByteTrack splits its two
+                    association stages on these; without them the low-confidence
+                    rescue that handles occlusion cannot happen at all.
         Returns list of active tracks.
         """
         self.frame_count += 1
+        n = len(detections)
         if embeddings is None:
-            embeddings = [None] * len(detections)
+            embeddings = [None] * n
+        if scores is None:
+            scores = [1.0] * n
 
-        # Predict new positions (simple constant-velocity)
         for track in self.tracks.values():
             track.age += 1
             track.time_since_update += 1
 
-        if not detections:
-            self._remove_dead()
-            return list(self.tracks.values())
-
-        # Compute IoU matrix
-        det_array = np.array(detections)
-        track_list = list(self.tracks.values())
-        if track_list:
-            track_array = np.array([t.bbox for t in track_list])
-            iou_matrix = self._compute_iou(det_array, track_array)
+        if n:
+            dets = sv.Detections(
+                xyxy=np.asarray(detections, dtype=np.float32).reshape(-1, 4),
+                confidence=np.asarray(scores, dtype=np.float32),
+                # The tracker reorders and drops rows, so carry each detection's
+                # input position through as data rather than zipping by index on
+                # the way back out. Verified: it returned idx=[1,0] on frame 0.
+                data={"idx": np.arange(n)},
+            )
         else:
-            iou_matrix = np.zeros((len(detections), 0))
+            dets = sv.Detections.empty()
 
-        # Hungarian assignment
-        from scipy.optimize import linear_sum_assignment
-        if iou_matrix.size > 0:
-            row_ind, col_ind = linear_sum_assignment(-iou_matrix)
-        else:
-            row_ind, col_ind = np.array([]), np.array([])
+        tracked = self._tracker.update(dets)
 
-        matched_dets = set()
-        matched_trks = set()
-
-        for r, c in zip(row_ind, col_ind):
-            r, c = int(r), int(c)
-            if iou_matrix[r, c] < self.iou_threshold:
+        for i in range(len(tracked)):
+            tid = int(tracked.tracker_id[i])
+            # -1 until minimum_consecutive_frames is satisfied. A detection that
+            # has not yet earned an ID is a maybe, not a person — emitting it is
+            # how the old tracker turned single-frame false positives into
+            # attendees.
+            if tid < 0:
                 continue
-            track = track_list[c]
-            track.bbox = det_array[r]
+            src = int(tracked.data["idx"][i])
+            track = self.tracks.get(tid)
+            if track is None:
+                track = self._Track(tid, tracked.xyxy[i], window=self.embed_window)
+                self.tracks[tid] = track
+            track.bbox = tracked.xyxy[i]
             track.hits += 1
             track.time_since_update = 0
-            if embeddings[r] is not None:
-                track.add_embedding(embeddings[r])
+            if embeddings[src] is not None:
+                track.add_embedding(embeddings[src])
                 track.last_embed_frame = self.frame_count
-            matched_dets.add(r)
-            matched_trks.add(c)
-
-        # Create new tracks for unmatched detections
-        for i, det in enumerate(detections):
-            if i not in matched_dets:
-                tid = self._next_id
-                self._next_id += 1
-                emb = embeddings[i] if i < len(embeddings) else None
-                self.tracks[tid] = self._Track(tid, det, emb, window=self.embed_window)
 
         self._remove_dead()
         return list(self.tracks.values())
@@ -254,35 +280,6 @@ class ByteTrackWrapper:
         dead = [tid for tid, t in self.tracks.items() if t.time_since_update > self.max_age]
         for tid in dead:
             del self.tracks[tid]
-
-    def get_needing_embed(self, reembed_interval: int) -> list[int]:
-        """Return track IDs that need re-embedding."""
-        need = []
-        for tid, t in self.tracks.items():
-            if t.time_since_update >= reembed_interval or t.last_embed_frame == 0:
-                need.append(tid)
-        return need
-
-    @staticmethod
-    def _compute_iou(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
-        """Compute IoU between two sets of boxes. boxes_a: (N,4), boxes_b: (M,4)."""
-        N = len(boxes_a)
-        M = len(boxes_b)
-        iou = np.zeros((N, M))
-        for i in range(N):
-            # np.maximum/np.minimum, NOT the builtins: these broadcast one box
-            # against the whole (M,4) array. The builtins raise on any M > 1,
-            # which meant tracking crashed the moment a second person appeared.
-            xa = np.maximum(boxes_a[i, 0], boxes_b[:, 0])
-            ya = np.maximum(boxes_a[i, 1], boxes_b[:, 1])
-            xb = np.minimum(boxes_a[i, 2], boxes_b[:, 2])
-            yb = np.minimum(boxes_a[i, 3], boxes_b[:, 3])
-            inter = np.maximum(0, xb - xa) * np.maximum(0, yb - ya)
-            area_a = (boxes_a[i, 2] - boxes_a[i, 0]) * (boxes_a[i, 3] - boxes_a[i, 1])
-            area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
-            union = area_a + area_b - inter
-            iou[i] = inter / np.maximum(union, 1e-6)
-        return iou
 
 
 class Pipeline:
@@ -296,12 +293,31 @@ class Pipeline:
             det_size=profile.det_size,
             use_half=profile.use_half_precision,
         )
-        self.tracker = ByteTrackWrapper(max_age=30, min_hits=2, embed_window=config.track_embed_window)
+        self.tracker = None
+        self.reset_tracker()
         self.matcher = None  # lazy-loaded
+        self.zones = load_zones()  # empty list = whole frame counts
 
         self._frame_interval = 1.0 / profile.analysis_fps
         self._last_analysis_time = 0.0
         self._frame_idx = 0
+
+    def reset_tracker(self):
+        """
+        Fresh tracker for a new session — IDs and embedding windows must not carry
+        across sessions. Every caller goes through here so the settings live in one
+        place; three separate call sites used to repeat them, and one of them
+        quietly omitted embed_window.
+        """
+        profile = self.config.profile
+        self.tracker = ByteTrackWrapper(
+            # Frames, so it has to scale with the analysis rate to stay a fixed
+            # ~2s of tolerance for someone walking behind an obstruction.
+            max_age=profile.analysis_fps * 2,
+            min_hits=2,
+            embed_window=self.config.track_embed_window,
+            frame_rate=profile.analysis_fps,
+        )
 
     def load_gallery(self, index_path: str, meta_path: str, live_only: bool = False):
         self.matcher = GalleryMatcher(index_path, meta_path, live_only=live_only)
@@ -328,24 +344,26 @@ class Pipeline:
                 inference_ms=(time.time() - t0) * 1000,
             )
 
-        # Cap faces to avoid OOM
+        # Cap faces to avoid OOM. Keep the most confident ones: the old key was
+        # the embedding's L2 norm, which is not a quality measure of anything.
         if len(faces) > profile.max_faces_per_frame:
-            faces = sorted(faces, key=lambda f: np.linalg.norm(f.embedding) if hasattr(f, 'embedding') else 0, reverse=True)
+            faces = sorted(faces, key=lambda f: float(f.det_score), reverse=True)
             faces = faces[:profile.max_faces_per_frame]
 
         # Extract embeddings for all detected faces
         bboxes = []
         embeddings = []
+        scores = []
         for face in faces:
-            bboxes.append(face.bbox.astype(int))
+            # Float, not int: the Kalman filter works in continuous coordinates
+            # and rounding every box to whole pixels feeds it quantisation noise.
+            bboxes.append(face.bbox.astype(np.float32))
             # insightface already L2-normalizes this for us
             embeddings.append(face.normed_embedding.astype(np.float32))
+            scores.append(float(face.det_score))
 
         # Track
-        tracks = self.tracker.update(bboxes, embeddings)
-
-        # Identify which tracks need (re-)embedding — only embed stale or new tracks
-        need_embed_ids = set(self.tracker.get_needing_embed(profile.track_reembed_interval))
+        tracks = self.tracker.update(bboxes, embeddings, scores)
         active_ids = {t.id for t in tracks}
 
         # Match against gallery + selective anti-spoof
@@ -361,10 +379,20 @@ class Pipeline:
             # seen across many small frames is identified as well as one seen
             # close up. No face-size filter: small faces are the CCTV workload.
             det.observations = track.observations
+            det.zone = zone_for(track.bbox, self.zones, frame.shape[1], frame.shape[0])
             if track.embedding is not None and self.matcher:
                 name, roll, score = self.matcher.match(track.embedding, self.config.match_threshold)
-                det.name = name
-                det.roll = roll
+                if name != "Unknown":
+                    track.name, track.roll = name, roll
+                # Identity is sticky for the life of the track. The averaged
+                # embedding only improves as observations accumulate, so a frame
+                # that dips back under the threshold is noise, not a different
+                # person — and re-deciding every frame made the label strobe
+                # between the name and Unknown for anyone scoring near 0.32.
+                # The window still rolls off on an ID switch, so a genuinely new
+                # person in this slot re-matches rather than inheriting the name.
+                det.name = track.name
+                det.roll = track.roll
                 det.match_score = score
 
             # Anti-spoof: only check every N-th analysis frame per track,

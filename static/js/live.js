@@ -355,6 +355,142 @@
     } catch (err) { /* enumerateDevices unavailable; leave buttons as-is */ }
   })();
 
+  // ---------------- zone editor ----------------
+  // Zones are stored normalized 0..1, so they survive the camera being
+  // reconfigured to a different resolution.
+
+  const stage = document.getElementById('video-stage');
+  const zoneName = document.getElementById('zone-name');
+  const zoneDraw = document.getElementById('zone-draw');
+  const zoneUndo = document.getElementById('zone-undo');
+  const zoneSave = document.getElementById('zone-save');
+  const zoneClear = document.getElementById('zone-clear');
+  const zoneStatus = document.getElementById('zone-status');
+
+  let drawing = false, pts = [], savedZones = [];
+
+  // The feed is object-fit:contain, so the image is letterboxed inside the
+  // element. Mapping a click against the element's own rect would skew every
+  // point by the size of the bars.
+  function imageBox() {
+    const showingStream = camStream && camStream.style.display !== 'none';
+    const el = showingStream ? camStream : webcam;
+    const r = el.getBoundingClientRect();
+    const natW = el.naturalWidth || el.videoWidth || CAP_W;
+    const natH = el.naturalHeight || el.videoHeight || CAP_H;
+    if (!natW || !natH) return { left: r.left, top: r.top, w: r.width, h: r.height };
+    const scale = Math.min(r.width / natW, r.height / natH);
+    const w = natW * scale, h = natH * scale;
+    return { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, w, h };
+  }
+
+  function drawPolygon() {
+    const sr = stage.getBoundingClientRect();
+    overlay.width = sr.width;
+    overlay.height = sr.height;
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    if (!pts.length) return;
+    const b = imageBox();
+    const sx = x => b.left - sr.left + x * b.w;
+    const sy = y => b.top - sr.top + y * b.h;
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = COLOR_UNKNOWN;
+    ctx.fillStyle = 'rgba(245,158,11,.15)';
+    ctx.beginPath();
+    ctx.moveTo(sx(pts[0][0]), sy(pts[0][1]));
+    for (const p of pts.slice(1)) ctx.lineTo(sx(p[0]), sy(p[1]));
+    if (pts.length > 2) { ctx.closePath(); ctx.fill(); }
+    ctx.stroke();
+    ctx.fillStyle = COLOR_UNKNOWN;
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(sx(p[0]), sy(p[1]), 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  async function refreshZones() {
+    try {
+      const d = await (await fetch('/api/zones')).json();
+      savedZones = d.zones || [];
+      zoneStatus.textContent = savedZones.length
+        ? 'Active: ' + savedZones.map(z => z.name).join(', ')
+        : 'No zones — the whole frame counts.';
+    } catch (err) { /* leave the hint as-is */ }
+  }
+
+  function setDrawing(on) {
+    drawing = on;
+    zoneDraw.textContent = on ? 'Stop drawing' : 'Draw';
+    stage.classList.toggle('drawing', on);
+    if (on) zoneStatus.textContent = 'Click the feed to place corners.';
+  }
+
+  stage.addEventListener('click', ev => {
+    if (!drawing) return;
+    const b = imageBox();
+    const x = (ev.clientX - b.left) / b.w;
+    const y = (ev.clientY - b.top) / b.h;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return;   // clicked the letterbox bar
+    pts.push([+x.toFixed(4), +y.toFixed(4)]);
+    zoneUndo.disabled = false;
+    zoneSave.disabled = pts.length < 3;
+    zoneStatus.textContent = pts.length + (pts.length === 1 ? ' point' : ' points')
+      + (pts.length < 3 ? ' — need at least 3' : '');
+    drawPolygon();
+  });
+
+  zoneDraw.addEventListener('click', () => setDrawing(!drawing));
+
+  zoneUndo.addEventListener('click', () => {
+    pts.pop();
+    zoneUndo.disabled = !pts.length;
+    zoneSave.disabled = pts.length < 3;
+    drawPolygon();
+  });
+
+  zoneSave.addEventListener('click', async () => {
+    const name = (zoneName.value || '').trim();
+    if (!name) { zoneStatus.textContent = 'Give the zone a name first.'; return; }
+    const body = { zones: savedZones.concat([{ name, points: pts }]) };
+    try {
+      const r = await (await fetch('/api/zones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })).json();
+      if (!r.ok) { zoneStatus.textContent = r.error || 'Could not save.'; return; }
+      pts = [];
+      zoneName.value = '';
+      zoneSave.disabled = true;
+      zoneUndo.disabled = true;
+      setDrawing(false);
+      drawPolygon();
+      await refreshZones();
+    } catch (err) { zoneStatus.textContent = 'Could not reach the server.'; }
+  });
+
+  zoneClear.addEventListener('click', async () => {
+    pts = [];
+    zoneSave.disabled = true;
+    zoneUndo.disabled = true;
+    setDrawing(false);
+    drawPolygon();
+    try {
+      await fetch('/api/zones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ zones: [] }),
+      });
+      await refreshZones();
+    } catch (err) { zoneStatus.textContent = 'Could not reach the server.'; }
+  });
+
+  window.addEventListener('resize', drawPolygon);
+  refreshZones();
+
   // The stream lives on the server, so a page refresh leaves it running with the
   // client unaware — reattach instead of reporting "already running".
   (async () => {

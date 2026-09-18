@@ -38,6 +38,19 @@
         MJPEG phone app just paste the host, <code>/video</code> is added automatically.</p>
         <p class="hint" id="cam-status"></p>
       </div>
+      <div class="section-gap">
+        <label class="field-label">Attendance zone</label>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
+          <input type="text" id="zone-name" style="flex:1;min-width:140px;" placeholder="Zone name, e.g. Classroom">
+          <button class="btn btn-outline" id="zone-draw">Draw</button>
+          <button class="btn btn-outline" id="zone-undo" disabled>Undo point</button>
+          <button class="btn btn-primary" id="zone-save" disabled>Save zone</button>
+          <button class="btn btn-danger-ghost" id="zone-clear">Clear all</button>
+        </div>
+        <p class="hint" style="margin-top:.4rem;">Click the feed to place corners — 3 or more makes a zone.
+        Only faces standing inside count for attendance; with no zone the whole frame counts.</p>
+        <p class="hint" id="zone-status"></p>
+      </div>
       <div class="live-stats">
         <span>FPS: <strong id="stat-fps">0</strong></span>
         <span>Inference: <strong id="stat-inf">0</strong>ms</span>

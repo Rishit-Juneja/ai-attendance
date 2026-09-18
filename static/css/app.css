@@ -236,8 +236,12 @@ input[type=text]::placeholder{color:var(--text-dim);}
 .video-stage video,.video-stage canvas,.video-stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
 /* network-camera feed sits above the (unused) webcam <video> element */
 .video-stage img#cam-stream{z-index:1;object-fit:contain;}
-.video-stage canvas{pointer-events:none;}
-.video-stage .stage-off{color:var(--text-dim);display:flex;flex-direction:column;align-items:center;gap:.6rem;font-size:.85rem;z-index:2;}
+/* Must clear img#cam-stream (z-index 1), or the zone outline draws behind the
+   feed and looks like nothing happened. pointer-events:none so the zone
+   editor's clicks reach .video-stage underneath. */
+.video-stage canvas{pointer-events:none;z-index:2;}
+.video-stage.drawing{cursor:crosshair;}
+.video-stage .stage-off{color:var(--text-dim);display:flex;flex-direction:column;align-items:center;gap:.6rem;font-size:.85rem;z-index:3;}
 .video-stage .stage-off .icon{width:30px;height:30px;}
 .video-controls{display:flex;gap:.6rem;margin-top:.9rem;align-items:center;}
 .live-stats{display:flex;gap:1.4rem;margin-top:.8rem;font-size:.76rem;color:var(--text-dim);}
