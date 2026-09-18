@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}Live — AI Attendance{% endblock %}
+{% block page_title %}Live &amp; Database{% endblock %}
+{% block page_meta %}Webcam recognition (stand-in for CCTV) and enrollment{% endblock %}
+{% block topbar_right %}
+<span class="live-pill" id="live-status-pill"><span class="dot"></span> Camera off</span>
+{% endblock %}
+
+{% block content %}
+
+<div class="live-layout">
+  <div>
+    <div class="card">
+      <h2>Camera feed</h2>
+      <div class="video-stage" id="video-stage">
+        <video id="webcam" autoplay playsinline muted></video>
+        <img id="cam-stream" style="display:none;width:100%;height:100%;object-fit:contain;">
+        <canvas id="overlay"></canvas>
+        <div class="stage-off" id="stage-off">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m21 8-5 3.2v1.6l5 3.2Z"/><path d="m4 4 16 16"/></svg>
+          Camera is off
+        </div>
+      </div>
+      <div class="video-controls">
+        <button class="btn btn-primary" id="start-btn">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m21 8-5 3.2v1.6l5 3.2Z"/></svg>
+          Start session
+        </button>
+        <button class="btn btn-outline" id="stop-btn" disabled>Stop &amp; save log</button>
+      </div>
+      <div class="section-gap">
+        <label class="field-label" for="cam-url">Network camera (phone app or CCTV)</label>
+        <div style="display:flex;gap:.5rem;">
+          <input type="text" id="cam-url" style="flex:1;" placeholder="http://192.168.0.50:8080  or  rtsp://user:pass@192.168.0.60:554/stream1">
+          <button class="btn btn-outline" id="cam-btn">Connect</button>
+        </div>
+        <p class="hint" style="margin-top:.4rem;">Runs server-side — no browser camera permission needed. For an
+        MJPEG phone app just paste the host, <code>/video</code> is added automatically.</p>
+        <p class="hint" id="cam-status"></p>
+      </div>
+      <div class="live-stats">
+        <span>FPS: <strong id="stat-fps">0</strong></span>
+        <span>Inference: <strong id="stat-inf">0</strong>ms</span>
+        <span>Present: <strong id="stat-present">0</strong></span>
+        <span>Alerts: <strong id="stat-alerts">0</strong></span>
+      </div>
+    </div>
+
+    <div class="card section-gap">
+      <h2>Attendance log</h2>
+      <div class="list-scroll" id="attendee-list">
+        <div class="empty-state"><span>Start a session to populate attendance.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="side-col">
+    <div class="card">
+      <h2>Enroll a new face</h2>
+      <div class="field">
+        <label class="field-label">Full name</label>
+        <input type="text" id="enroll-name" placeholder="e.g. Krish Sharma">
+      </div>
+      <div class="field">
+        <label class="field-label">Roll / ID</label>
+        <input type="text" id="enroll-roll" placeholder="e.g. CS2024001">
+      </div>
+      <div class="dropzone" id="dz-enroll" style="min-height:110px;">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
+        <strong>Photos of this person</strong>
+        <span>Add 2–4 at different angles — averaged into one entry, which is what
+              lets a distant camera face match. One works, but scores much lower.</span>
+        <input type="file" accept="image/*" id="enroll-input" multiple>
+      </div>
+      <button class="btn btn-primary btn-block section-gap" id="enroll-btn" disabled>Add to database</button>
+      <p class="hint" id="enroll-status"></p>
+    </div>
+
+    <div class="card">
+      <h2>Enrolled database (<span id="gallery-count">{{ gallery|length }}</span>)</h2>
+      <div class="list-scroll" id="gallery-list">
+        {% for p in gallery %}
+        <div class="person-row" data-roll="{{ p.roll }}">
+          <img class="person-thumb" src="{{ p.photo_url }}" alt="{{ p.name }}">
+          <div class="person-info">
+            <div class="n">{{ p.name }}</div>
+            <div class="r">{{ p.roll }}</div>
+          </div>
+          <button class="btn btn-danger-ghost btn-sm remove-person" data-roll="{{ p.roll }}" aria-label="Remove {{ p.name }}">
+            <svg class="icon" style="width:15px;height:15px" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-8 0 1 13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1l1-13"/></svg>
+          </button>
+        </div>
+        {% else %}
+        <div class="empty-state"><span>No one enrolled yet.</span></div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Alerts</h2>
+      <div class="list-scroll" id="alert-list">
+        <div class="empty-state"><span>No alerts.</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/live.js') }}"></script>
+{% endblock %}

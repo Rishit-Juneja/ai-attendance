@@ -1,0 +1,706 @@
+"""
+Interactive web console: overview dashboard, ad-hoc person identification
+(image/video), and a live webcam page with attendance logging + enrollment
+database management.
+
+This is separate from dashboard.py (the aiohttp+Flask live-run dashboard driven
+by main.py) — this app is the operator console used to test/enroll/demo before
+real CCTV ingestion exists.
+
+Run:
+    python -m src.webapp --gpu-profile dev
+    Open http://localhost:5000
+"""
+import argparse
+import base64
+import json
+import tempfile
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+
+from . import enroll as enroll_mod
+from .antispoof import SpoofChecker
+from .attendance import AttendanceLogger
+from .config import (
+    Config,
+    ENROLLMENT_DIR,
+    GALLERY_INDEX_PATH,
+    GALLERY_META_PATH,
+    LOGS_DIR,
+    STATIC_DIR,
+    TEMPLATES_DIR,
+)
+from .pipeline import ArcFaceEmbedder, ByteTrackWrapper, Pipeline
+from .reports import generate_daily_csv, generate_daily_pdf
+
+app = Flask(__name__, template_folder=str(TEMPLATES_DIR), static_folder=str(STATIC_DIR))
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB upload cap
+
+
+@app.url_defaults
+def _stamp_static(endpoint, values):
+    """
+    Append the file's mtime to every static URL. Without this the browser keeps
+    serving a cached app.js/app.css after an edit, so the page silently runs old
+    code against a new API — which looks like a backend bug and isn't one.
+    """
+    if endpoint == "static" and "filename" in values:
+        path = STATIC_DIR / values["filename"]
+        if path.exists():
+            values["v"] = int(path.stat().st_mtime)
+
+_config = Config()
+_embedder: ArcFaceEmbedder | None = None
+_pipeline: Pipeline | None = None
+_spoof_checker: SpoofChecker | None = None
+_logger: AttendanceLogger | None = None
+
+_PLACEHOLDER_AVATAR = (
+    "data:image/svg+xml;utf8,"
+    "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40'>"
+    "<rect width='40' height='40' rx='8' fill='%231c1c1f'/>"
+    "<circle cx='20' cy='16' r='7' fill='%233a3a3f'/>"
+    "<path d='M6 34a14 14 0 0 1 28 0Z' fill='%233a3a3f'/></svg>"
+)
+
+
+def get_embedder() -> ArcFaceEmbedder:
+    global _embedder
+    if _embedder is None:
+        profile = _config.profile
+        _embedder = ArcFaceEmbedder(det_size=profile.det_size, use_half=profile.use_half_precision)
+    return _embedder
+
+
+def get_pipeline() -> Pipeline:
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = Pipeline(_config, embedder=get_embedder())
+        if GALLERY_INDEX_PATH.exists() and GALLERY_META_PATH.exists():
+            _pipeline.load_gallery(str(GALLERY_INDEX_PATH), str(GALLERY_META_PATH), live_only=True)
+    return _pipeline
+
+
+def get_spoof_checker() -> SpoofChecker:
+    global _spoof_checker
+    if _spoof_checker is None:
+        _spoof_checker = SpoofChecker(
+            movement_threshold=_config.spoof_pixel_movement_thresh,
+            flag_after_n=_config.spoof_frame_count,
+        )
+    return _spoof_checker
+
+
+def _reload_gallery_into_pipeline():
+    if _pipeline is not None and GALLERY_INDEX_PATH.exists() and GALLERY_META_PATH.exists():
+        _pipeline.load_gallery(str(GALLERY_INDEX_PATH), str(GALLERY_META_PATH), live_only=True)
+
+
+# ---------------- small image helpers ----------------
+
+def read_upload_image(file_storage) -> np.ndarray | None:
+    data = file_storage.read()
+    if not data:
+        return None
+    arr = np.frombuffer(data, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def decode_data_url(data_url: str) -> np.ndarray | None:
+    b64data = data_url.split(",", 1)[1] if "," in data_url else data_url
+    arr = np.frombuffer(base64.b64decode(b64data), dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def encode_jpeg_b64(img: np.ndarray, quality: int = 85) -> str:
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return base64.b64encode(buf).decode("ascii")
+
+
+# Advisory only — nothing is filtered on this. A reference face below this width
+# makes a noisy embedding that drags every score down, so we say so rather than
+# letting the user conclude the person isn't in the photo. Small faces in the
+# *target* are fine and expected; it's the reference that needs to be good.
+WEAK_REF_PX = 80
+
+# Two good reference shots of the same person pair at ~0.5-0.6 (measured: two
+# Krish photos = 0.574); different people land near 0. 0.35 splits them.
+SAME_PERSON_REF_SIM = 0.35
+
+
+def embed_reference(img: np.ndarray) -> tuple[np.ndarray, int] | None:
+    """
+    Largest-face embedding from a single reference photo, plus that face's pixel
+    width. The width matters: a reference cropped from a small/distant face makes
+    a weak embedding that drags down every score computed against it, which reads
+    as "the system can't find this person" when the real problem is the reference.
+    """
+    faces = get_embedder().model.get(img)
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    bbox = face.bbox.astype(int)
+    return face.normed_embedding.astype(np.float32), int(bbox[2] - bbox[0])
+
+
+def embed_references(images: list[np.ndarray]) -> tuple[np.ndarray, int, int] | None:
+    """
+    Average several reference photos of one person into one vector.
+
+    A single image search can't use track aggregation (there's no track), so this
+    is the only lever that lifts a distant target face out of the impostor noise.
+    Measured against a 25px target: 1 photo scored 0.2795, 4 photos scored 0.3449,
+    while the best impostor moved only 0.2527 -> 0.2629.
+
+    Returns (mean_embedding, widest_face_px, count, indices_of_odd_ones_out).
+    """
+    got = [r for r in (embed_reference(im) for im in images) if r is not None]
+    if not got:
+        return None
+    embs = [e for e, _ in got]
+    mean = np.mean(embs, axis=0)
+    norm = np.linalg.norm(mean)
+    mean = (mean / norm if norm > 0 else mean).astype(np.float32)
+
+    # Each reference contributes its *largest* face. Hand this a group photo and
+    # it silently averages in a stranger, dragging the reference away from the
+    # person you're looking for. Catch that instead of quietly degrading.
+    #
+    # Compare references pairwise, NOT against their own mean: with two vectors
+    # the mean sits exactly between them, so even two unrelated faces score 0.707
+    # against it — geometry, not similarity. Pairwise is count-independent.
+    odd = []
+    if len(embs) > 1:
+        sims = np.array(embs) @ np.array(embs).T
+        np.fill_diagonal(sims, -1.0)
+        # Clean frontal shots of one person pair well above the match threshold;
+        # anything that resembles no other reference is the odd one out.
+        odd = [i for i in range(len(embs)) if sims[i].max() < SAME_PERSON_REF_SIM]
+    return mean, max(w for _, w in got), len(got), odd
+
+
+def gallery_lookup(emb: np.ndarray) -> dict | None:
+    """Who is this, according to the enrolled database? None if nobody clears the bar."""
+    matcher = get_pipeline().matcher
+    if matcher is None or matcher.index.ntotal == 0:
+        return None
+    name, roll, score = matcher.match(emb, _config.match_threshold)
+    if name == "Unknown":
+        return None
+    return {"name": name, "roll": roll, "score": round(score, 4)}
+
+
+def detect_and_score(img: np.ndarray, ref_emb: np.ndarray, threshold: float | None = None) -> list[dict]:
+    """
+    Detect every face, score it against the reference, and separately ask the
+    enrolled gallery who it is. The two answers are independent: the reference
+    says "is this the person you uploaded", the gallery says "is this someone we
+    already know". Showing both means an enrolled person gets named even when the
+    reference photo is too weak to clear the threshold on its own.
+    """
+    threshold = _config.match_threshold if threshold is None else threshold
+    faces = get_embedder().model.get(img)
+    results = []
+    for face in faces:
+        emb = face.normed_embedding.astype(np.float32)
+        bbox = face.bbox.astype(int)
+        results.append({
+            "bbox": bbox.tolist(),
+            "width": int(bbox[2] - bbox[0]),
+            "score": float(np.dot(emb, ref_emb)),
+            "matched": float(np.dot(emb, ref_emb)) > threshold,
+            "identity": gallery_lookup(emb),
+        })
+    return results
+
+
+def draw_matches(img: np.ndarray, results: list[dict]) -> np.ndarray:
+    out = img.copy()
+    for r in results:
+        x1, y1, x2, y2 = r["bbox"]
+        who = r.get("identity")
+        if r["matched"]:
+            color, thickness = (0, 200, 0), 3
+            label = f"{who['name']} {r['score']:.2f}" if who else f"MATCH {r['score']:.2f}"
+        elif who:
+            # Not the person being searched for, but someone the database knows.
+            color, thickness, label = (200, 140, 0), 2, f"{who['name']} {r['score']:.2f}"
+        else:
+            color, thickness, label = (140, 140, 140), 1, f"{r['score']:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        ly = max(0, y1 - th - 8)
+        cv2.rectangle(out, (x1, ly), (x1 + tw + 8, ly + th + 8), color, -1)
+        cv2.putText(out, label, (x1 + 4, ly + th + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    return out
+
+
+# ---------------- overview data ----------------
+
+def _overview_data():
+    enrolled = 0
+    if GALLERY_META_PATH.exists():
+        with open(GALLERY_META_PATH) as f:
+            enrolled = len(json.load(f))
+
+    session_dirs = sorted(
+        (d for d in LOGS_DIR.iterdir() if d.is_dir()),
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    ) if LOGS_DIR.exists() else []
+
+    sessions = []
+    total_alerts = 0
+    last_present = 0
+    last_present_set = False
+
+    for d in session_dirs:
+        log_file = d / "attendance.json"
+        if not log_file.exists():
+            continue
+        with open(log_file) as f:
+            data = json.load(f)
+        total_alerts += data.get("alerts", 0)
+        if not last_present_set:
+            last_present = data.get("present_now", 0)
+            last_present_set = True
+        if len(sessions) < 8:
+            sessions.append({
+                "session": data.get("session", d.name),
+                "present_now": data.get("present_now", 0),
+                "absent": data.get("absent", 0),
+                "spoof_detected": data.get("spoof_detected", 0),
+                "alerts": data.get("alerts", 0),
+                "saved_at": datetime.fromtimestamp(log_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+
+    stats = {
+        "enrolled": enrolled,
+        "sessions": len(session_dirs),
+        "total_alerts": total_alerts,
+        "last_present": last_present,
+    }
+    return stats, sessions
+
+
+def _photo_url_for(m: dict) -> str:
+    candidates = []
+    if m.get("photo"):
+        candidates.append(Path(m["photo"]).name)
+    candidates.append(f"{m['roll']}_best.jpg")
+    for name in candidates:
+        if name and (ENROLLMENT_DIR / name).exists():
+            return f"/enrollment_photo/{name}"
+    return _PLACEHOLDER_AVATAR
+
+
+def _gallery_list() -> list[dict]:
+    if not GALLERY_META_PATH.exists():
+        return []
+    with open(GALLERY_META_PATH) as f:
+        meta = json.load(f)
+    return [{"name": m["name"], "roll": m["roll"], "photo_url": _photo_url_for(m)} for m in meta]
+
+
+# ---------------- pages ----------------
+
+@app.route("/")
+def home():
+    stats, sessions = _overview_data()
+    return render_template(
+        "home.html", active_page="home", gallery_count=stats["enrolled"],
+        gpu_profile=_config.gpu_profile, stats=stats, sessions=sessions,
+    )
+
+
+@app.route("/identify")
+def identify_page():
+    stats, _ = _overview_data()
+    return render_template(
+        "identify.html", active_page="identify", gallery_count=stats["enrolled"],
+        gpu_profile=_config.gpu_profile, match_threshold=_config.match_threshold,
+    )
+
+
+@app.route("/live")
+def live_page():
+    stats, _ = _overview_data()
+    return render_template(
+        "live.html", active_page="live", gallery_count=stats["enrolled"],
+        gpu_profile=_config.gpu_profile, gallery=_gallery_list(),
+    )
+
+
+@app.route("/enrollment_photo/<path:filename>")
+def enrollment_photo(filename):
+    return send_from_directory(str(ENROLLMENT_DIR), filename)
+
+
+# ---------------- identify API ----------------
+
+@app.route("/api/identify/image", methods=["POST"])
+def api_identify_image():
+    ref_files = request.files.getlist("reference")
+    target_file = request.files.get("target")
+    if not (ref_files and target_file):
+        return jsonify({"ok": False, "error": "Both a reference photo and a target image are required."}), 400
+
+    ref_imgs = [im for im in (read_upload_image(f) for f in ref_files) if im is not None]
+    target_img = read_upload_image(target_file)
+    if not ref_imgs or target_img is None:
+        return jsonify({"ok": False, "error": "Could not read one of the uploaded images."}), 400
+
+    ref = embed_references(ref_imgs)
+    if ref is None:
+        return jsonify({"ok": False, "error": "No face detected in the reference photo(s)."}), 400
+    ref_emb, ref_width, ref_count, ref_odd = ref
+
+    results = detect_and_score(target_img, ref_emb)
+    annotated = draw_matches(target_img, results)
+
+    return jsonify({
+        "ok": True,
+        "matches": results,
+        "best_score": max((r["score"] for r in results), default=0.0),
+        "ref_width": ref_width,
+        "ref_count": ref_count,
+        "ref_odd": ref_odd,
+        "ref_identity": gallery_lookup(ref_emb),
+        "known_count": sum(1 for r in results if r.get("identity")),
+        # One reference photo is the single biggest limit on a distant match, so
+        # nudge for more before the user concludes the person isn't in the photo.
+        "ref_weak": ref_width < WEAK_REF_PX or ref_count < 2 or bool(ref_odd),
+        "weak_ref_px": WEAK_REF_PX,
+        "threshold": _config.match_threshold,
+        "annotated_image": encode_jpeg_b64(annotated),
+    })
+
+
+# ponytail: synchronous request capped at MAX_SAMPLED_FRAMES so a big video can't
+# hang the server; move to a background job + progress polling if longer videos
+# or higher sample rates are needed.
+MAX_SAMPLED_FRAMES = 90
+
+
+@app.route("/api/identify/video", methods=["POST"])
+def api_identify_video():
+    ref_files = request.files.getlist("reference")
+    target_file = request.files.get("target")
+    if not (ref_files and target_file):
+        return jsonify({"ok": False, "error": "Both a reference photo and a target video are required."}), 400
+
+    ref_imgs = [im for im in (read_upload_image(f) for f in ref_files) if im is not None]
+    if not ref_imgs:
+        return jsonify({"ok": False, "error": "Could not read the reference image."}), 400
+    ref = embed_references(ref_imgs)
+    if ref is None:
+        return jsonify({"ok": False, "error": "No face detected in the reference photo(s)."}), 400
+    ref_emb, ref_width, ref_count, ref_odd = ref
+
+    try:
+        target_fps = float(request.form.get("fps", 3))
+    except ValueError:
+        target_fps = 3.0
+    target_fps = max(1.0, min(5.0, target_fps))
+
+    suffix = Path(target_file.filename or "video.mp4").suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        target_file.save(tmp.name)
+        tmp_path = tmp.name
+
+    frames_out = []
+    best_score = 0.0
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            return jsonify({"ok": False, "error": "Could not open that video file."}), 400
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        step = max(1, round(source_fps / target_fps))
+
+        frame_idx = 0
+        while len(frames_out) < MAX_SAMPLED_FRAMES:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0:
+                results = detect_and_score(frame, ref_emb)
+                matched = any(r["matched"] for r in results)
+                score = max((r["score"] for r in results), default=0.0)
+                best_score = max(best_score, score)
+                annotated = draw_matches(frame, results) if results else frame
+                thumb = cv2.resize(annotated, (240, 180))
+                frames_out.append({
+                    "t": frame_idx / source_fps,
+                    "matched": matched,
+                    "score": score,
+                    "thumb": encode_jpeg_b64(thumb, quality=70),
+                })
+            frame_idx += 1
+        cap.release()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    return jsonify({
+        "ok": True,
+        "frames": frames_out,
+        "best_score": best_score,
+        "ref_width": ref_width,
+        "ref_count": ref_count,
+        "ref_odd": ref_odd,
+        "ref_identity": gallery_lookup(ref_emb),
+        "ref_weak": ref_width < WEAK_REF_PX or ref_count < 2 or bool(ref_odd),
+        "weak_ref_px": WEAK_REF_PX,
+        "threshold": _config.match_threshold,
+    })
+
+
+# ---------------- gallery (database) API ----------------
+
+@app.route("/api/gallery", methods=["GET"])
+def api_gallery_list():
+    return jsonify({"ok": True, "gallery": _gallery_list()})
+
+
+@app.route("/api/gallery", methods=["POST"])
+def api_gallery_add():
+    name = request.form.get("name", "").strip()
+    roll = request.form.get("roll", "").strip()
+    photos = [p for p in request.files.getlist("photo") if p.filename]
+    if not (name and roll and photos):
+        return jsonify({"ok": False, "error": "Name, roll and at least one photo are required."}), 400
+
+    # Several photos get averaged into one gallery vector — that averaging is what
+    # lets a distant CCTV face clear the threshold. Measured on a 24px face: a
+    # 1-photo entry scored 0.2663, a 2-photo average of the same person 0.3044.
+    tmp_paths = []
+    try:
+        for photo in photos:
+            suffix = Path(photo.filename or "photo.jpg").suffix or ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                photo.save(tmp.name)
+                tmp_paths.append(tmp.name)
+        ok = enroll_mod.enroll_person(name, roll, tmp_paths, get_embedder())
+    finally:
+        for p in tmp_paths:
+            Path(p).unlink(missing_ok=True)
+
+    if not ok:
+        return jsonify({"ok": False, "error": "No face detected, or that roll number is already enrolled."}), 400
+
+    _reload_gallery_into_pipeline()
+    return jsonify({"ok": True, "photos": len(tmp_paths)})
+
+
+@app.route("/api/gallery/<roll>", methods=["DELETE"])
+def api_gallery_remove(roll):
+    ok = enroll_mod.remove_person(roll)
+    if ok:
+        _reload_gallery_into_pipeline()
+    return jsonify({"ok": ok})
+
+
+# ---------------- live webcam API ----------------
+
+@app.route("/api/live/start", methods=["POST"])
+def api_live_start():
+    global _logger, _spoof_checker
+    _logger = AttendanceLogger(session_name=f"live_{datetime.now():%Y%m%d_%H%M%S}")
+    pipeline = get_pipeline()
+    pipeline.tracker = ByteTrackWrapper(max_age=30, min_hits=2)
+    _spoof_checker = SpoofChecker(
+        movement_threshold=_config.spoof_pixel_movement_thresh,
+        flag_after_n=_config.spoof_frame_count,
+    )
+    return jsonify({"ok": True, "session": _logger.session_name})
+
+
+@app.route("/api/live/frame", methods=["POST"])
+def api_live_frame():
+    global _logger
+    payload = request.get_json(silent=True) or {}
+    data_url = payload.get("image", "")
+    if not data_url:
+        return jsonify({"ok": False, "error": "No image received."}), 400
+    frame = decode_data_url(data_url)
+    if frame is None:
+        return jsonify({"ok": False, "error": "Could not decode frame."}), 400
+
+    if _logger is None:
+        _logger = AttendanceLogger(session_name=f"live_{datetime.now():%Y%m%d_%H%M%S}")
+
+    pipeline = get_pipeline()
+    result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
+    _logger.process_detections(result.detections, result.frame_idx, result.timestamp)
+    summary = _logger.get_summary()
+
+    detections = [{
+        "track_id": d.track_id,
+        "bbox": d.bbox.tolist(),
+        "name": d.name,
+        "roll": d.roll,
+        "score": round(d.match_score, 3),
+        "is_spoof": d.is_spoof,
+    } for d in result.detections]
+
+    return jsonify({
+        "ok": True,
+        "detections": detections,
+        "summary": summary,
+        "inference_ms": result.inference_ms,
+    })
+
+
+# ---------------- network camera (phone / CCTV) ----------------
+#
+# The browser-webcam path needs a real /dev/video device. A phone running an
+# MJPEG server app, or any CCTV camera speaking RTSP, is read straight by
+# cv2.VideoCapture instead — no v4l2loopback, no kernel module, no root. This is
+# the same ingestion path a real camera will use.
+
+_stream = {"cap": None, "thread": None, "run": False, "frame": None, "err": None, "url": ""}
+_stream_lock = threading.Lock()
+
+
+def _stream_worker(url: str):
+    """Pull frames, run the pipeline, keep the latest annotated frame for the feed."""
+    global _logger
+    cap = cv2.VideoCapture(url)
+    # Don't let a dead camera wedge the worker forever.
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+    if not cap.isOpened():
+        _stream["err"] = f"Could not open stream: {url}"
+        _stream["run"] = False
+        return
+
+    _stream["cap"] = cap
+    pipeline = get_pipeline()
+    misses = 0
+    while _stream["run"]:
+        ok, frame = cap.read()
+        if not ok:
+            misses += 1
+            if misses > 30:
+                _stream["err"] = "Stream ended or camera unreachable."
+                break
+            continue
+        misses = 0
+
+        # Throttle analysis to the profile's fps; the feed still shows every frame.
+        if pipeline.should_analyze():
+            result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
+            if _logger is not None:
+                _logger.process_detections(result.detections, result.frame_idx, result.timestamp)
+            for d in result.detections:
+                x1, y1, x2, y2 = d.bbox.astype(int)
+                known = d.name != "Unknown"
+                color = (0, 0, 255) if d.is_spoof else ((0, 200, 0) if known else (140, 140, 140))
+                label = f"{d.name} {d.match_score:.2f}" if known else f"#{d.track_id} {d.match_score:.2f}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, label, (x1, max(12, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        with _stream_lock:
+            _stream["frame"] = frame
+    cap.release()
+    _stream["cap"] = None
+    _stream["run"] = False
+
+
+@app.route("/api/live/stream_start", methods=["POST"])
+def api_live_stream_start():
+    global _logger, _spoof_checker
+    url = (request.get_json(silent=True) or {}).get("url", "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "A camera URL is required."}), 400
+    if _stream["run"]:
+        return jsonify({"ok": False, "error": "A stream is already running."}), 400
+
+    # IP Webcam-style apps serve the stream at /video; accept the bare host too.
+    if url.startswith("http") and not any(url.rstrip("/").endswith(s) for s in ("/video", ".mjpg", ".mjpeg", "/videofeed")):
+        url = url.rstrip("/") + "/video"
+
+    _logger = AttendanceLogger(session_name=f"cam_{datetime.now():%Y%m%d_%H%M%S}")
+    pipeline = get_pipeline()
+    pipeline.tracker = ByteTrackWrapper(max_age=30, min_hits=2, embed_window=_config.track_embed_window)
+    _spoof_checker = SpoofChecker(
+        movement_threshold=_config.spoof_pixel_movement_thresh,
+        flag_after_n=_config.spoof_frame_count,
+    )
+    _stream.update(run=True, err=None, frame=None, url=url)
+    _stream["thread"] = threading.Thread(target=_stream_worker, args=(url,), daemon=True)
+    _stream["thread"].start()
+    return jsonify({"ok": True, "url": url, "session": _logger.session_name})
+
+
+@app.route("/api/live/snapshot")
+def api_live_snapshot():
+    """
+    Latest annotated frame as a plain JPEG, polled by the client.
+
+    Deliberately not multipart/x-mixed-replace: that holds a connection open for
+    the whole session, which starves Flask's dev server of workers, and some
+    embedded browsers refuse to render it at all. Polling single JPEGs is a few
+    more requests and works everywhere.
+    """
+    with _stream_lock:
+        frame = _stream["frame"]
+    if frame is None:
+        return ("", 204)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    if not ok:
+        return ("", 204)
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/api/live/stream_status")
+def api_live_stream_status():
+    return jsonify({
+        "ok": True,
+        "running": _stream["run"],
+        "url": _stream["url"],
+        "error": _stream["err"],
+        "summary": _logger.get_summary() if _logger else None,
+    })
+
+
+@app.route("/api/live/stream_stop", methods=["POST"])
+def api_live_stream_stop():
+    _stream["run"] = False
+    if _stream["thread"]:
+        _stream["thread"].join(timeout=3)
+    return api_live_stop()
+
+
+@app.route("/api/live/stop", methods=["POST"])
+def api_live_stop():
+    global _logger
+    if _logger is None:
+        return jsonify({"ok": False, "error": "No active session."}), 400
+
+    _logger.save_log()
+    _logger.export_csv()
+    generate_daily_csv(_logger.records, _logger.session_name)
+    generate_daily_pdf(_logger.records, _logger.alerts, _logger.session_name)
+    session_name = _logger.session_name
+    _logger = None
+    return jsonify({"ok": True, "session": session_name})
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AI Attendance web console")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--gpu-profile", default=_config.gpu_profile, choices=["dev", "demo"])
+    args = parser.parse_args()
+    _config.gpu_profile = args.gpu_profile
+    app.run(host=args.host, port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

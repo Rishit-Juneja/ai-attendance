@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}AI Attendance{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M12 4a4 4 0 0 1 4 4v1a4 4 0 0 1-8 0V8a4 4 0 0 1 4-4Z"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
+      </div>
+      <div>
+        <div class="brand-text">AI Attendance</div>
+        <div class="brand-sub">Vision Console</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <a class="nav-link {% if active_page=='home' %}active{% endif %}" href="{{ url_for('home') }}">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v9a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1v-9"/></svg>
+        Overview
+      </a>
+      <a class="nav-link {% if active_page=='identify' %}active{% endif %}" href="{{ url_for('identify_page') }}">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.6-4.6"/></svg>
+        Identify
+      </a>
+      <a class="nav-link {% if active_page=='live' %}active{% endif %}" href="{{ url_for('live_page') }}">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m21 8-5 3.2v1.6l5 3.2Z"/></svg>
+        Live &amp; Database
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <strong>{{ gallery_count if gallery_count is defined else 0 }} enrolled</strong>
+      GPU profile: {{ gpu_profile if gpu_profile is defined else 'dev' }}
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div>
+        <h1>{% block page_title %}Overview{% endblock %}</h1>
+        <div class="topbar-meta">{% block page_meta %}{% endblock %}</div>
+      </div>
+      {% block topbar_right %}{% endblock %}
+    </header>
+    <section class="content">
+      {% block content %}{% endblock %}
+    </section>
+  </div>
+</div>
+{% block scripts %}{% endblock %}
+</body>
+</html>

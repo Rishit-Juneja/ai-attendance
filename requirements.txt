@@ -1,0 +1,15 @@
+# GPU note: onnxruntime-gpu 1.30 links CUDA 13 / cuDNN 9. The [cuda,cudnn] extras
+# pull those as wheels, so no system cuDNN is needed. Drop the extras (plain
+# `onnxruntime`) for a CPU-only box — nothing else here needs changing.
+onnxruntime-gpu[cuda,cudnn]>=1.30.0
+insightface>=0.7.3
+opencv-python-headless>=4.8.0
+faiss-cpu>=1.8.0          # gallery is ~30x512 floats; GPU faiss buys nothing here
+numpy>=1.24.0
+scipy>=1.11.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+websockets>=12.0
+aiohttp>=3.9.0
+flask>=3.0.0
+reportlab>=4.0.0

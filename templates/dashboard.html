@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Attendance - Live</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#e2e8f0; --accent:#3b82f6; --green:#22c55e; --red:#ef4444; --orange:#f97316; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Inter',-apple-system,sans-serif; background:var(--bg); color:var(--text); }
+  .header { background:var(--card); border-bottom:1px solid var(--border); padding:.75rem 1.5rem; display:flex; justify-content:space-between; align-items:center; }
+  .header h1 { font-size:1.1rem; font-weight:600; }
+  .status { display:flex; gap:1rem; align-items:center; font-size:.8rem; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .dot.live { background:var(--green); animation:pulse 1.5s infinite; }
+  .dot.off { background:var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  .layout { display:grid; grid-template-columns:1fr 320px; gap:.75rem; padding:.75rem; height:calc(100vh - 52px); }
+  .col { display:flex; flex-direction:column; gap:.75rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:.5rem; padding:.75rem; }
+  .card h2 { font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; color:#94a3b8; margin-bottom:.5rem; }
+
+  /* Stats bar */
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:.5rem; }
+  .stat { text-align:center; }
+  .stat .val { font-size:1.6rem; font-weight:700; }
+  .stat .lbl { font-size:.65rem; color:#94a3b8; }
+  .stat.ok .val { color:var(--green); }
+  .stat.no .val { color:var(--red); }
+  .stat.sp .val { color:var(--orange); }
+  .stat.fps .val { color:var(--accent); }
+  .meta { display:flex; gap:1rem; font-size:.7rem; color:#64748b; margin-top:.4rem; }
+
+  /* Scene composite */
+  .scene-wrap { flex:1; min-height:0; display:flex; flex-direction:column; }
+  .scene-wrap img { width:100%; border-radius:.4rem; flex:1; object-fit:contain; background:#111; }
+
+  /* Live face feed */
+  .face-feed { flex:1; overflow-y:auto; min-height:0; }
+  .face-row { display:flex; gap:.5rem; padding:.35rem 0; border-bottom:1px solid var(--border); align-items:center; }
+  .face-row:last-child { border:none; }
+  .face-thumb { width:48px; height:48px; border-radius:.3rem; object-fit:cover; border:2px solid var(--green); flex-shrink:0; }
+  .face-thumb.spoof { border-color:var(--red); }
+  .face-thumb.unknown { border-color:var(--orange); }
+  .face-info { flex:1; min-width:0; }
+  .face-name { font-weight:600; font-size:.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .face-roll { font-size:.7rem; color:#94a3b8; }
+  .face-score { font-size:.65rem; color:#64748b; }
+  .face-badge { padding:1px 6px; border-radius:99px; font-size:.6rem; font-weight:600; }
+  .face-badge.match { background:rgba(34,197,94,.15); color:var(--green); }
+  .face-badge.nomatch { background:rgba(249,115,22,.15); color:var(--orange); }
+
+  /* Attendee list */
+  .attendee-list { flex:1; overflow-y:auto; min-height:0; }
+  .att-item { display:flex; justify-content:space-between; align-items:center; padding:.35rem 0; border-bottom:1px solid var(--border); font-size:.8rem; }
+  .att-item:last-child { border:none; }
+  .att-badge { padding:1px 6px; border-radius:99px; font-size:.6rem; font-weight:600; }
+  .att-badge.in { background:rgba(34,197,94,.15); color:var(--green); }
+  .att-badge.out { background:rgba(239,68,68,.15); color:var(--red); }
+
+  /* Alerts */
+  .alert-list { max-height:180px; overflow-y:auto; }
+  .alert-item { padding:.3rem 0; border-bottom:1px solid var(--border); font-size:.75rem; }
+  .alert-item:last-child { border:none; }
+  .alert-t { color:#64748b; font-size:.65rem; }
+  .alert-tp { font-weight:600; }
+  .alert-tp.spoof { color:var(--orange); }
+  .alert-tp.unknown_face { color:var(--red); }
+  .alert-d { color:#94a3b8; font-size:.7rem; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>AI Attendance System</h1>
+  <div class="status">
+    <span><span class="dot" id="dot"></span> <span id="stxt">Connecting...</span></span>
+    <span id="frameInfo">Frame 0</span>
+    <span id="timeInfo">--:--:--</span>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="col">
+    <!-- Stats -->
+    <div class="card">
+      <div class="stats">
+        <div class="stat ok"><div class="val" id="present">0</div><div class="lbl">Present</div></div>
+        <div class="stat no"><div class="val" id="absent">0</div><div class="lbl">Absent</div></div>
+        <div class="stat sp"><div class="val" id="spoofs">0</div><div class="lbl">Spoofs</div></div>
+        <div class="stat fps"><div class="val" id="fps">0</div><div class="lbl">FPS</div></div>
+      </div>
+      <div class="meta">
+        <span>Inference: <strong id="inferMs">0</strong>ms</span>
+        <span>Enrolled: <strong id="enrolled">0</strong></span>
+      </div>
+    </div>
+
+    <!-- Live scene composite -->
+    <div class="card scene-wrap">
+      <h2>Live Scene</h2>
+      <img id="sceneImg" src="" alt="Live scene">
+    </div>
+  </div>
+
+  <div class="col">
+    <!-- Live face detections -->
+    <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0;">
+      <h2>Detected Faces</h2>
+      <div class="face-feed" id="faceFeed"></div>
+    </div>
+
+    <!-- Attendee list -->
+    <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0;">
+      <h2>Attendance Log</h2>
+      <div class="attendee-list" id="attendeeList"></div>
+    </div>
+
+    <!-- Alerts -->
+    <div class="card">
+      <h2>Alerts</h2>
+      <div class="alert-list" id="alertList"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const WS_PORT = {{ ws_port }};
+const WS_URL = `ws://${location.hostname}:${WS_PORT}/ws`;
+let ws;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    document.getElementById('dot').className = 'dot live';
+    document.getElementById('stxt').textContent = 'LIVE';
+  };
+  ws.onclose = () => {
+    document.getElementById('dot').className = 'dot off';
+    document.getElementById('stxt').textContent = 'Reconnecting...';
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = (e) => { try { update(JSON.parse(e.data)); } catch(err) { console.error(err); } };
+}
+
+function update(d) {
+  const s = d.summary || {};
+
+  // Stats
+  document.getElementById('present').textContent = s.present_now || 0;
+  document.getElementById('absent').textContent = s.absent || 0;
+  document.getElementById('spoofs').textContent = s.spoof_detected || 0;
+  document.getElementById('fps').textContent = d.fps || 0;
+  document.getElementById('inferMs').textContent = d.inference_ms || 0;
+  document.getElementById('enrolled').textContent = s.total_enrolled || 0;
+  document.getElementById('frameInfo').textContent = `Frame ${d.frame_idx || 0}`;
+  document.getElementById('timeInfo').textContent = d.timestamp || '';
+
+  // Scene composite image
+  if (d.scene_composite) {
+    document.getElementById('sceneImg').src = 'data:image/jpeg;base64,' + d.scene_composite;
+  }
+
+  // Face detections with thumbnails
+  const dets = d.detections || [];
+  const feedHtml = dets.map(f => {
+    const cls = f.is_spoof ? 'spoof' : (f.name === 'Unknown' ? 'unknown' : '');
+    const badge = f.name !== 'Unknown'
+      ? `<span class="face-badge match">MATCH</span>`
+      : `<span class="face-badge nomatch">?</span>`;
+    return `
+      <div class="face-row">
+        <img class="face-thumb ${cls}" src="data:image/jpeg;base64,${f.face_image}" alt="face">
+        <div class="face-info">
+          <div class="face-name">${f.name}</div>
+          <div class="face-roll">${f.roll || 'unregistered'}</div>
+          <div class="face-score">score: ${f.score.toFixed(3)}</div>
+        </div>
+        ${badge}
+      </div>`;
+  }).join('');
+  document.getElementById('faceFeed').innerHTML = feedHtml || '<div style="color:#64748b;padding:.5rem;">Waiting for faces...</div>';
+
+  // Attendee list
+  const persons = (s.persons || []).sort((a,b) => {
+    if (a.present && !b.present) return -1;
+    if (!a.present && b.present) return 1;
+    return a.name.localeCompare(b.name);
+  });
+  const attHtml = persons.map(p => `
+    <div class="att-item">
+      <div>
+        <strong>${p.name}</strong>
+        <span style="color:#94a3b8;font-size:.7rem;"> ${p.roll}</span>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span style="font-size:.7rem;color:#64748b;">${p.entry || '--'}${p.exit ? '→'+p.exit : ''}</span>
+        <span class="att-badge ${p.present?'in':'out'}">${p.present?'IN':'OUT'}</span>
+      </div>
+    </div>
+  `).join('');
+  document.getElementById('attendeeList').innerHTML = attHtml || '<div style="color:#64748b;padding:.5rem;">No attendees yet</div>';
+
+  // Alerts
+  const alerts = (d.alerts || []).slice().reverse();
+  const alertHtml = alerts.map(a => `
+    <div class="alert-item">
+      <div class="alert-t">${a.time}</div>
+      <div class="alert-tp ${a.type}">${a.type.replace(/_/g,' ').toUpperCase()}</div>
+      <div class="alert-d">${a.details}</div>
+    </div>
+  `).join('');
+  document.getElementById('alertList').innerHTML = alertHtml || '<div style="color:#64748b;">No alerts</div>';
+}
+
+connect();
+</script>
+</body>
+</html>

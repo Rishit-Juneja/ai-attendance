@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Identify — AI Attendance{% endblock %}
+{% block page_title %}Identify{% endblock %}
+{% block page_meta %}Find one specific person inside an image or video{% endblock %}
+
+{% block content %}
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>1. Reference photos</h2>
+    <div class="dropzone" id="dz-ref">
+      <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
+      <strong>Photos of the person</strong>
+      <span>Add 2–4 shots at different angles — they get averaged, which is what
+            pulls a distant face above the threshold. One photo works, but scores far lower.</span>
+      <input type="file" accept="image/*" id="ref-input" multiple>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="flex-between" style="margin-bottom:.9rem;">
+      <h2 style="margin:0;">2. Search target</h2>
+    </div>
+    <div class="tabs" id="target-tabs">
+      <div class="tab active" data-mode="image">Image</div>
+      <div class="tab" data-mode="video">Video</div>
+    </div>
+    <div class="dropzone" id="dz-target">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+      <strong id="dz-target-label">Photo to search</strong>
+      <span id="dz-target-hint">A crowd photo, CCTV still, etc.</span>
+      <input type="file" accept="image/*" id="target-input">
+    </div>
+  </div>
+</div>
+
+<div class="flex-between section-gap">
+  <p class="hint" style="margin:0;">Match confidence threshold: {{ "%.2f"|format(match_threshold) }} cosine similarity (ArcFace, 512-d embeddings).</p>
+  <button class="btn btn-primary" id="run-btn" disabled>
+    <svg class="icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.6-4.6"/></svg>
+    Run identification
+  </button>
+</div>
+
+<div id="results" class="section-gap" style="display:none;"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/identify.js') }}"></script>
+{% endblock %}
