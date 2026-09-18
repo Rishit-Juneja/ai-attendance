@@ -12,6 +12,13 @@ numpy>=1.24.0
 # maintained replacement.) scipy went with it: its only use here was the
 # Hungarian assignment in the hand-rolled tracker this replaced.
 trackers>=2.6.0
+# Person detection runs YOLO11n on the onnxruntime above — no torch at runtime.
+# `ultralytics` (which pulls torch, ~2.5GB) is BUILD-TIME ONLY, needed once to
+# produce data/models/yolo11n.onnx via tools/export_person_model.py, and can be
+# uninstalled afterwards. Deliberately not listed as a dependency: two CUDA
+# runtimes in one process each reserve their own VRAM pool.
+# Note YOLO11 is AGPL-3.0 — fine for internal/competition use, network-copyleft
+# if this is ever shipped or served publicly. Apache-2.0 swaps: YOLOX, RTMDet.
 Pillow>=10.0.0
 tqdm>=4.65.0
 websockets>=12.0

@@ -299,7 +299,10 @@
     const tick = () => {
       if (!camOn) return;
       const img = new Image();
-      img.onload = () => { camStream.src = img.src; feedTimer = setTimeout(tick, 120); };
+      // 120ms capped the feed at ~8fps regardless of what the camera or the
+      // server produced — the display was the bottleneck, not the pipeline.
+      // Analysis stays slow on purpose; only the picture needs to be fluid.
+      img.onload = () => { camStream.src = img.src; feedTimer = setTimeout(tick, 40); };
       img.onerror = () => { feedTimer = setTimeout(tick, 500); };
       img.src = '/api/live/snapshot?t=' + Date.now();
     };

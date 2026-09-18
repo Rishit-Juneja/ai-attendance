@@ -85,6 +85,13 @@ class Config:
     # scores 0.46 aggregated vs 0.28 from a single frame.
     match_threshold: float = 0.32
     track_embed_window: int = 30        # observations averaged per track; rolls off on ID switch
+    # Seconds a track survives with no detection before it is destroyed and the
+    # person returns as a stranger. Raised from 2s after live testing: a face
+    # hidden for longer than this loses its name entirely.
+    # CAUTION: identity is sticky per track, so a long buffer also means a track
+    # whose ID gets handed to someone else keeps the old name. Body tracking is
+    # the real fix; this is the knob until then.
+    track_lost_sec: float = 8.0
     entry_cooldown_sec: float = 30.0    # min seconds between repeated entry logs
     absent_after_sec: float = 300.0     # mark absent after 5 min of no detection
     spoof_pixel_movement_thresh: float = 1.5  # motion heuristic threshold

@@ -175,6 +175,30 @@ def test_walking_person_survives_an_occlusion_gap():
     )
 
 
+def test_lost_track_is_not_reported_as_present():
+    """
+    update() used to return every track in the dict, including ones not matched
+    this frame. A person who walked out kept a ghost box at their last position
+    for max_age frames — counted present, and overlapping their own new track on
+    return, which raised a bogus multiple_overlapping alert on the live camera.
+    """
+    from src.pipeline import ByteTrackWrapper
+
+    rng = np.random.default_rng(5)
+    emb = _unit(rng)
+    tracker = ByteTrackWrapper(embed_window=30, frame_rate=20)
+    box = np.array([10, 40, 40, 80], dtype=np.float32)
+
+    for _ in range(5):
+        tracker.update([box], [emb], [0.9])
+    assert len(tracker.update([box], [emb], [0.9])) == 1
+
+    # They leave: detector returns nothing.
+    assert tracker.update([], [], []) == [], "a vanished face was still reported"
+    # ...and the embedding window is still retained for their return.
+    assert tracker.tracks, "track was discarded instantly instead of buffered"
+
+
 def test_one_frame_detection_is_not_a_person():
     """
     min_hits was set in three places and read in none, so a single spurious
@@ -309,6 +333,81 @@ def test_new_track_is_not_called_a_stranger_immediately():
 
     log.process_detections([_Det(track_id=3, observations=9)], 9, 1009.0)
     assert len(log.alerts) == 1, "should alert once the track has settled"
+
+
+def test_batched_embeddings_match_the_reference_path():
+    """
+    detect() batches ArcFace instead of running one forward pass per face (98
+    faces: 911ms -> 192ms). The batched crops MUST come out identical to
+    FaceAnalysis.get(), because the gallery was enrolled through that path — an
+    embedding taken even slightly differently is not comparable to it, which is
+    precisely how every stranger once matched "Krish".
+
+    Skipped when the model or sample photos aren't present.
+    """
+    import os
+
+    photo = "data/test_faces/pic1.jpeg"
+    if not os.path.exists(photo):
+        print("    (skipped: sample photo not available)")
+        return
+
+    import cv2
+
+    from src.config import Config
+    from src.pipeline import ArcFaceEmbedder
+
+    img = cv2.imread(photo)
+    cfg = Config(gpu_profile="dev")
+    emb = ArcFaceEmbedder(det_size=cfg.profile.det_size, emb_batch=cfg.profile.emb_batch)
+
+    new, old = emb.detect(img), emb.model.get(img)
+    assert len(new) == len(old), f"face counts diverged: {len(new)} vs {len(old)}"
+
+    def centre(b):
+        return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+
+    for f in new:
+        c = centre(f.bbox)
+        nearest = min(old, key=lambda g: (centre(g.bbox)[0] - c[0]) ** 2
+                      + (centre(g.bbox)[1] - c[1]) ** 2)
+        sim = float(f.normed_embedding @ nearest.normed_embedding)
+        assert sim > 0.9999, f"batched embedding diverged from reference: {sim:.6f}"
+        assert abs(np.linalg.norm(f.normed_embedding) - 1.0) < 1e-5
+
+
+def test_boxes_glide_between_analysis_frames():
+    """
+    Analysis runs slower than the camera on purpose. Drawing the last analysed box
+    verbatim on the frames in between makes it freeze then jump, which reads as lag
+    even when the video is smooth. Boxes must carry forward at their last measured
+    velocity — and must not sail off when analysis stalls.
+    """
+    from src.webapp import BoxGlide
+
+    class D:
+        def __init__(self, tid, x):
+            self.track_id = tid
+            self.bbox = np.array([x, 40, x + 30, 80], dtype=np.float32)
+
+    g = BoxGlide()
+    g.observe([D(1, 10)], 0.0)
+    g.observe([D(1, 40)], 0.3)          # 100 px/sec
+
+    mid = g.bbox_at(1, 0.45)
+    assert abs(mid[0] - 55.0) < 0.01, f"expected x=55 halfway, got {mid[0]}"
+
+    stalled = g.bbox_at(1, 10.0)
+    cap = 40 + 100 * g.max_extrapolate_sec
+    assert abs(stalled[0] - cap) < 0.01, f"extrapolation ran away to {stalled[0]}"
+
+    # One sighting is not a velocity.
+    g2 = BoxGlide()
+    g2.observe([D(2, 10)], 0.0)
+    assert g2.bbox_at(2, 5.0)[0] == 10, "extrapolated from a single observation"
+
+    g.observe([], 0.6)
+    assert g.bbox_at(1, 0.6) is None, "a vanished track kept gliding"
 
 
 def test_zone_gates_attendance():

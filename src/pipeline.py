@@ -11,6 +11,7 @@ import faiss
 import numpy as np
 import supervision as sv
 from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 from trackers import ByteTrackTracker
 
 from .config import Config, GPUProfile
@@ -40,10 +41,24 @@ class FrameResult:
     num_faces: int = 0
 
 
+@dataclass
+class _DetectedFace:
+    """
+    What detect() returns. Mirrors the attributes of insightface's Face that this
+    codebase actually uses, so the batched path is a drop-in for FaceAnalysis.get().
+    """
+    bbox: np.ndarray
+    kps: np.ndarray
+    det_score: float
+    embedding: np.ndarray
+    normed_embedding: np.ndarray
+
+
 class ArcFaceEmbedder:
     """Wraps InsightFace for detection + embedding."""
 
-    def __init__(self, det_size=(640, 640), use_half=False, providers=None, det_thresh=0.4):
+    def __init__(self, det_size=(640, 640), use_half=False, providers=None, det_thresh=0.4,
+                 emb_batch=32):
         import onnxruntime as ort
         available = ort.get_available_providers()
         if providers:
@@ -63,6 +78,8 @@ class ArcFaceEmbedder:
         # so this buys the low bucket without flooding normal scenes with junk.
         self.model.prepare(ctx_id=0, det_thresh=det_thresh, det_size=det_size)
         self.det_model = self.model.det_model
+        self.rec_model = self.model.models["recognition"]
+        self.emb_batch = emb_batch
 
         # get_available_providers() lists CUDA even when its libs fail to load at
         # session creation, and ORT then falls back to CPU without raising. Report
@@ -76,7 +93,38 @@ class ArcFaceEmbedder:
         print(f"[ArcFace] running on {'GPU' if self.on_gpu else 'CPU'} ({self.providers[0]})")
 
     def detect(self, frame: np.ndarray) -> list:
-        return self.model.get(frame)
+        """
+        Detect + embed every face, embedding in batches.
+
+        FaceAnalysis.get() runs recognition one face at a time — measured 9.3ms
+        each, so a 98-face frame cost 926ms while detection itself stayed flat at
+        10ms. That serial loop, not the detector, is what puts a crowded room out
+        of real-time reach. emb_batch has been in config.py all along, read by
+        nothing.
+
+        Alignment is identical to the path this replaces: face_align.norm_crop with
+        the 5-point landmarks is exactly what rec_model.get() does internally.
+        That matters — embeddings taken without it are not comparable to the
+        gallery, which is the bug that made every stranger match "Krish".
+        """
+        bboxes, kpss = self.det_model.detect(frame, max_num=0, metric="default")
+        if bboxes is None or len(bboxes) == 0:
+            return []
+
+        crops = [face_align.norm_crop(frame, landmark=kpss[i], image_size=112)
+                 for i in range(len(bboxes))]
+        feats = [self.rec_model.get_feat(crops[i:i + self.emb_batch])
+                 for i in range(0, len(crops), self.emb_batch)]
+        feats = np.vstack(feats).astype(np.float32)
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        normed = feats / np.maximum(norms, 1e-9)
+
+        return [_DetectedFace(bbox=bboxes[i, :4].astype(np.float32),
+                              kps=kpss[i],
+                              det_score=float(bboxes[i, 4]),
+                              embedding=feats[i],
+                              normed_embedding=normed[i])
+                for i in range(len(bboxes))]
 
     def embed(self, frame: np.ndarray, bbox: np.ndarray) -> np.ndarray | None:
         face = self.model.get(frame, det_size=tuple(map(int, bbox)))
@@ -274,7 +322,13 @@ class ByteTrackWrapper:
                 track.last_embed_frame = self.frame_count
 
         self._remove_dead()
-        return list(self.tracks.values())
+        # Only tracks matched THIS frame. self.tracks keeps lost ones alive for
+        # max_age so their embedding window survives a brief occlusion, but
+        # emitting them as live detections meant a person who left the frame kept
+        # a ghost box at their last position for ~2s — counted as present, and
+        # overlapping the new track when they came back, which is what raised
+        # "multiple_overlapping IoU=0.67" for a single person on the live camera.
+        return [t for t in self.tracks.values() if t.time_since_update == 0]
 
     def _remove_dead(self):
         dead = [tid for tid, t in self.tracks.items() if t.time_since_update > self.max_age]
@@ -292,6 +346,7 @@ class Pipeline:
         self.embedder = embedder or ArcFaceEmbedder(
             det_size=profile.det_size,
             use_half=profile.use_half_precision,
+            emb_batch=profile.emb_batch,
         )
         self.tracker = None
         self.reset_tracker()
@@ -312,8 +367,12 @@ class Pipeline:
         profile = self.config.profile
         self.tracker = ByteTrackWrapper(
             # Frames, so it has to scale with the analysis rate to stay a fixed
-            # ~2s of tolerance for someone walking behind an obstruction.
-            max_age=profile.analysis_fps * 2,
+            # number of seconds of tolerance. Measured on the live camera: at 2s
+            # (40 frames) turning away for ~9s destroyed the track, and the person
+            # came back nameless for 5.4s until a clean frontal view rebuilt the
+            # embedding window. Identity is sticky per track, so a longer buffer
+            # is what actually carries a name through a face being hidden.
+            max_age=int(profile.analysis_fps * self.config.track_lost_sec),
             min_hits=2,
             embed_window=self.config.track_embed_window,
             frame_rate=profile.analysis_fps,

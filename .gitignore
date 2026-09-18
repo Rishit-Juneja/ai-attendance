@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 data/
+# ultralytics drops the .pt and its .onnx export in the cwd; the copy the app
+# loads is data/models/yolo11n.onnx, which data/ already covers. Safe to delete.
+yolo11n.pt
+yolo11n.onnx

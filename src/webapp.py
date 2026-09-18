@@ -568,6 +568,54 @@ _stream = {"cap": None, "thread": None, "run": False, "frame": None, "err": None
 _stream_lock = threading.Lock()
 
 
+class BoxGlide:
+    """
+    Advances detection boxes along their measured velocity between analysis frames.
+
+    Analysis is meant to run slower than the camera — re-detecting every frame
+    just to keep the overlay alive is the GPU doing display work. But drawing the
+    last analysed box verbatim on the frames in between makes it sit still and
+    then jump, which reads as lag even though the video itself is smooth. This
+    carries each box forward at the speed it was last seen moving, so the overlay
+    tracks the person continuously while detection stays cheap.
+
+    Extrapolation is capped at one step so a box does not sail off across the room
+    when someone stops walking or the analysis stalls.
+    """
+
+    def __init__(self, max_extrapolate_sec: float = 0.4):
+        self._last: dict[int, tuple[np.ndarray, float]] = {}
+        self._prev: dict[int, tuple[np.ndarray, float]] = {}
+        self.max_extrapolate_sec = max_extrapolate_sec
+
+    def observe(self, detections, now: float):
+        for d in detections:
+            tid = d.track_id
+            if tid in self._last:
+                self._prev[tid] = self._last[tid]
+            self._last[tid] = (np.asarray(d.bbox, dtype=np.float32).copy(), now)
+        live = {d.track_id for d in detections}
+        for tid in [t for t in self._last if t not in live]:
+            self._last.pop(tid, None)
+            self._prev.pop(tid, None)
+
+    def bbox_at(self, track_id: int, now: float) -> np.ndarray | None:
+        cur = self._last.get(track_id)
+        if cur is None:
+            return None
+        bbox, t1 = cur
+        prev = self._prev.get(track_id)
+        if prev is None:
+            return bbox                      # only one sighting; nothing to extrapolate from
+        pbox, t0 = prev
+        dt = t1 - t0
+        if dt <= 1e-3:
+            return bbox
+        velocity = (bbox - pbox) / dt
+        ahead = min(max(now - t1, 0.0), self.max_extrapolate_sec)
+        return bbox + velocity * ahead
+
+
 def _stream_worker(url: str):
     """Pull frames, run the pipeline, keep the latest annotated frame for the feed."""
     global _logger
@@ -589,6 +637,7 @@ def _stream_worker(url: str):
     pipeline = get_pipeline()
     misses = 0
     last_dets = []
+    glide = BoxGlide()
     while _stream["run"]:
         ok, frame = cap.read()
         if not ok:
@@ -600,19 +649,22 @@ def _stream_worker(url: str):
         misses = 0
 
         # Throttle analysis to the profile's fps; the feed still shows every frame.
+        now = time.time()
         if pipeline.should_analyze():
             result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
             last_dets = result.detections
+            glide.observe(last_dets, now)
             if _logger is not None:
                 _logger.process_detections(result.detections, result.frame_idx, result.timestamp)
 
-        # Drawn on EVERY frame, not just analysed ones. Publishing un-annotated
-        # frames in between is what made the box strobe: the overlay vanished on
-        # any frame that skipped analysis. Boxes go stale by at most one frame
-        # interval, which is invisible; a flashing box is not.
+        # Drawn on EVERY frame, not just analysed ones — publishing un-annotated
+        # frames in between made the box strobe. Positions are carried forward by
+        # BoxGlide rather than frozen, so the overlay stays smooth while analysis
+        # runs at a fraction of the camera's frame rate.
         draw_zones(frame, pipeline.zones)
         for d in last_dets:
-            x1, y1, x2, y2 = d.bbox.astype(int)
+            glided = glide.bbox_at(d.track_id, now)
+            x1, y1, x2, y2 = (d.bbox if glided is None else glided).astype(int)
             known = d.name != "Unknown"
             color = (0, 0, 255) if d.is_spoof else ((0, 200, 0) if known else (140, 140, 140))
             label = f"{d.name} {d.match_score:.2f}" if known else f"#{d.track_id} {d.match_score:.2f}"
