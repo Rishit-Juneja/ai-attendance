@@ -61,8 +61,19 @@
 
     <div class="card section-gap">
       <h2>Attendance log</h2>
+      <p class="hint">Present is earned by time in the room, not by being glimpsed —
+      anyone under the dwell threshold shows as <em>brief</em> and is not counted.</p>
       <div class="list-scroll" id="attendee-list">
         <div class="empty-state"><span>Start a session to populate attendance.</span></div>
+      </div>
+    </div>
+
+    <div class="card section-gap">
+      <h2>Needs review (<span id="unresolved-count">0</span>)</h2>
+      <p class="hint">People the system tracked but could not name. Assign an identity
+      and their time in the room is credited from when they arrived.</p>
+      <div class="list-scroll" id="unresolved-list">
+        <div class="empty-state"><span>Nobody to review.</span></div>
       </div>
     </div>
   </div>

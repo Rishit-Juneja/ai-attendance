@@ -18,12 +18,12 @@ def generate_daily_csv(records: dict, session_name: str, output_dir: str = None)
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Name", "Roll", "Entry Time", "Exit Time", "Duration (min)", "Status", "Detections", "Spoof Flags"])
+        writer.writerow(["Name", "Roll", "Entry Time", "Exit Time", "Dwell (min)", "Status", "Visits", "Detections", "Spoof Flags"])
         for roll, rec in sorted(records.items(), key=lambda x: x[1].entry_time):
             writer.writerow([
                 rec.name, rec.roll, rec.entry_time, rec.exit_time,
                 round(rec.duration_sec / 60, 1),
-                "Present" if rec.is_present else "Absent",
+                rec.status, len(rec.visits),
                 rec.detection_count, rec.spoof_flags,
             ])
 
@@ -54,19 +54,21 @@ def generate_daily_pdf(records: dict, alerts: list, session_name: str, output_di
     elements.append(Spacer(1, 0.3 * inch))
 
     # Summary stats
-    present = sum(1 for r in records.values() if r.is_present)
-    absent = sum(1 for r in records.values() if not r.is_present)
+    # Counted = met the dwell requirement. Someone merely glimpsed is "brief" and
+    # is reported apart from attendance rather than inflating it.
+    counted = sum(1 for r in records.values() if r.status != "brief")
+    brief = len(records) - counted
     spoofs = sum(1 for r in records.values() if r.spoof_flags > 0)
-    elements.append(Paragraph(f"Total Enrolled: {len(records)} | Present: {present} | Absent: {absent} | Spoofs Detected: {spoofs}", styles["Normal"]))
+    elements.append(Paragraph(f"Seen: {len(records)} | Attendance counted: {counted} | Too brief to count: {brief} | Spoofs Detected: {spoofs}", styles["Normal"]))
     elements.append(Spacer(1, 0.2 * inch))
 
     # Attendance table
-    data = [["Name", "Roll", "Entry", "Exit", "Duration (min)", "Status"]]
+    data = [["Name", "Roll", "Entry", "Exit", "Dwell (min)", "Visits", "Status"]]
     for roll, rec in sorted(records.items(), key=lambda x: x[1].entry_time):
         data.append([
             rec.name, rec.roll, rec.entry_time, rec.exit_time,
             str(round(rec.duration_sec / 60, 1)),
-            "Present" if rec.is_present else "Absent",
+            str(len(rec.visits)), rec.status,
         ])
 
     if len(data) > 1:

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
 
 from . import enroll as enroll_mod
 from .antispoof import SpoofChecker
@@ -62,6 +62,7 @@ _embedder: ArcFaceEmbedder | None = None
 _pipeline: Pipeline | None = None
 _spoof_checker: SpoofChecker | None = None
 _logger: AttendanceLogger | None = None
+_review: AttendanceLogger | None = None   # last finished session, still reviewable
 
 _PLACEHOLDER_AVATAR = (
     "data:image/svg+xml;utf8,"
@@ -537,7 +538,8 @@ def api_live_frame():
 
     pipeline = get_pipeline()
     result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
-    _logger.process_detections(result.detections, result.frame_idx, result.timestamp)
+    _logger.process_detections(result.detections, result.frame_idx, result.timestamp,
+                               frame=frame)
     summary = _logger.get_summary()
 
     detections = [{
@@ -655,7 +657,8 @@ def _stream_worker(url: str):
             last_dets = result.detections
             glide.observe(last_dets, now)
             if _logger is not None:
-                _logger.process_detections(result.detections, result.frame_idx, result.timestamp)
+                _logger.process_detections(result.detections, result.frame_idx,
+                                           result.timestamp, frame=frame)
 
         # Drawn on EVERY frame, not just analysed ones — publishing un-annotated
         # frames in between made the box strobe. Positions are carried forward by
@@ -789,19 +792,79 @@ def api_live_stream_stop():
     return api_live_stop()
 
 
+# ---------------- unresolved review queue ----------------
+
+def _reviewable():
+    """
+    The session a teacher can still act on. Reviewing happens AFTER class, and
+    stopping the session used to drop the logger — taking the whole unresolved
+    queue with it at exactly the moment it was needed.
+    """
+    return _logger if _logger is not None else _review
+
+
+@app.route("/api/live/unresolved")
+def api_unresolved():
+    log = _reviewable()
+    if log is None:
+        return jsonify({"ok": True, "unresolved": []})
+    return jsonify({"ok": True, "session": log.session_name,
+                    "unresolved": log.get_summary()["unresolved"]})
+
+
+@app.route("/api/live/unresolved/<int:track_id>/crop")
+def api_unresolved_crop(track_id):
+    log = _reviewable()
+    entry = log.unresolved.get(track_id) if log else None
+    if entry is None or not entry.crop_path or not Path(entry.crop_path).exists():
+        return ("", 404)
+    return send_file(entry.crop_path, mimetype="image/jpeg")
+
+
+@app.route("/api/live/resolve", methods=["POST"])
+def api_resolve():
+    """Teacher names an unresolved person; their dwell is back-dated to that name."""
+    log = _reviewable()
+    if log is None:
+        return jsonify({"ok": False, "error": "No session to review."}), 400
+    payload = request.get_json(silent=True) or {}
+    track_id = payload.get("track_id")
+    roll = (payload.get("roll") or "").strip()
+    name = (payload.get("name") or "").strip()
+    if track_id is None or not roll or not name:
+        return jsonify({"ok": False, "error": "Name and roll are both required."}), 400
+
+    rec = log.resolve(int(track_id), name, roll)
+    if rec is None:
+        return jsonify({"ok": False, "error": "That person is no longer in the queue."}), 404
+    if log is _review:
+        _write_session_files(log)   # the reports were already written; redo them
+    return jsonify({"ok": True, "roll": rec.roll, "name": rec.name,
+                    "dwell_sec": round(rec.duration_sec, 1), "status": rec.status})
+
+
+def _write_session_files(log):
+    log.save_log()
+    log.export_csv()
+    generate_daily_csv(log.records, log.session_name)
+    generate_daily_pdf(log.records, log.alerts, log.session_name)
+
+
 @app.route("/api/live/stop", methods=["POST"])
 def api_live_stop():
-    global _logger
+    global _logger, _review
     if _logger is None:
         return jsonify({"ok": False, "error": "No active session."}), 400
 
-    _logger.save_log()
-    _logger.export_csv()
-    generate_daily_csv(_logger.records, _logger.session_name)
-    generate_daily_pdf(_logger.records, _logger.alerts, _logger.session_name)
+    _logger.close_session()
+    _write_session_files(_logger)
+    # Kept for review, not discarded: naming the unresolved people is the work
+    # that happens after the class, and it rewrites these same files.
+    _review = _logger
     session_name = _logger.session_name
     _logger = None
-    return jsonify({"ok": True, "session": session_name})
+    return jsonify({"ok": True, "session": session_name,
+                    "unresolved": len(_review.unresolved)})
 
 
 def main():

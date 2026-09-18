@@ -73,6 +73,25 @@ Points are stored normalized 0..1 in `data/zones.json`, so a zone stays correct
 if the camera resolution changes. A zone is an *area*, not a tripwire: it answers
 "who is in the room", not "who crossed this line, which way".
 
+**Attendance is earned by dwell time, not by being seen.** Being detected marks
+nothing; accumulating `min_dwell_sec` (default 30s) inside a zone does. A visit
+survives gaps shorter than `exit_grace_sec` (default 60s) and keeps counting
+through them — that is deliberate, because a student with their head down or
+turned away loses their face for a minute at a time and is still sitting there.
+Longer gaps close the visit and record an exit; coming back opens a new one and
+the totals add up across all of them. Someone who only walks past the door ends
+up as `brief` and is reported separately rather than counted present.
+
+**Unresolved queue.** A tracked face that never matches the gallery is not
+thrown away — it becomes `person1..N` with its own dwell record, its best crop,
+and its entry time, and appears under "Needs review" on the Live page. A teacher
+types a name and roll, and the time that person was already in the room is
+credited to them retroactively. This queue outlives the session on purpose:
+the review happens after class, and resolving someone rewrites the saved report.
+Expect it to be the normal path rather than an edge case — identification needs
+roughly a 30px face where tracking only needs a 25px body, so in a large room
+the back rows are tracked long before they can be named.
+
 ### 4. Generate Reports
 
 Reports are auto-generated on shutdown. Manual:
@@ -116,7 +135,7 @@ ai-attendance/
 │   ├── config.py         # GPU profiles, thresholds, paths
 │   ├── pipeline.py       # Detect → Track → Embed → Match
 │   ├── antispoof.py      # Liveness/spoof detection
-│   ├── attendance.py     # Entry/exit logging, duration
+│   ├── attendance.py     # Dwell-based presence, unresolved queue, alerts
 │   ├── dashboard.py      # WebSocket + Flask dashboard
 │   ├── reports.py        # CSV + PDF report generation
 │   ├── enroll.py         # Enrollment script

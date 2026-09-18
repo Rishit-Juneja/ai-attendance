@@ -453,6 +453,136 @@ def test_zone_gates_attendance():
     assert "P1" in open_log.records, "no zones configured must mean no filtering"
 
 
+def _walk_past(log, det, start, seconds, step=0.5):
+    """Feed `seconds` of continuous detections, then one frame well after."""
+    t = start
+    while t < start + seconds:
+        log.process_detections([det], 0, t)
+        t += step
+    return t
+
+
+def test_walking_past_the_door_is_not_attendance():
+    """
+    The old rule marked you present after 3 detections — 300ms at 10fps. Anyone
+    crossing the doorway got a full attendance record.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_dwell_brief")
+    end = _walk_past(log, _Det(name="Krish", roll="K1"), 1000.0, seconds=4.0)
+
+    rec = log.records["K1"]
+    assert rec.duration_sec < 5, rec.duration_sec
+    assert rec.status == "brief", f"4 seconds counted as {rec.status}"
+    assert log.get_summary()["present_now"] == 0, "a passer-by was counted present"
+
+    # Same person, properly seated this time.
+    _walk_past(log, _Det(name="Krish", roll="K1"), end + 1, seconds=40.0)
+    assert rec.status == "present", rec.status
+    assert rec.duration_sec >= log.min_dwell_sec, rec.duration_sec
+    assert log.get_summary()["present_now"] == 1
+
+
+def test_dwell_survives_a_head_down_gap_then_closes_on_exit():
+    """
+    A student with their head down vanishes for a minute and is still sitting
+    there; someone who leaves must close their visit and stop accruing time.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_dwell_gap")
+    det = _Det(name="Krish", roll="K1")
+    _walk_past(log, det, 1000.0, seconds=40.0)
+    rec = log.records["K1"]
+
+    # Gap shorter than the grace period: one visit, and the gap is credited.
+    log.process_detections([det], 0, 1070.0)
+    assert len(rec.visits) == 1, f"a {log.exit_grace_sec}s gap split the visit"
+    assert rec.duration_sec >= 69, rec.duration_sec
+    assert rec.is_present
+
+    # Now they actually leave.
+    log.process_detections([], 0, 1070.0 + log.exit_grace_sec + 1)
+    assert not rec.is_present, "left the room but still marked present"
+    assert rec.exit_time, "no exit time recorded"
+    assert rec.status == "left"
+    dwell_at_exit = rec.duration_sec
+
+    # Time passing with them gone must not add dwell.
+    log.process_detections([], 0, 3000.0)
+    assert rec.duration_sec == dwell_at_exit, "dwell kept ticking after they left"
+
+    # They come back: second visit, dwell accumulates across both.
+    _walk_past(log, det, 3001.0, seconds=10.0)
+    assert len(rec.visits) == 2, len(rec.visits)
+    assert rec.duration_sec > dwell_at_exit
+    assert rec.is_present
+
+
+def test_unresolved_person_is_queued_and_resolves_retroactively():
+    """
+    An unidentified face must not be dropped. It sits in the queue as personN,
+    and naming it credits the time they were already there — not from now.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_unresolved")
+    _walk_past(log, _Det(track_id=4, observations=9), 1000.0, seconds=45.0)
+
+    queue = log.get_summary()["unresolved"]
+    assert len(queue) == 1, queue
+    assert queue[0]["label"] == "person1"
+    assert queue[0]["needs_action"], "45s in the room should need a decision"
+    assert queue[0]["dwell_sec"] >= log.min_dwell_sec
+
+    rec = log.resolve(4, "Rishit", "11825210004")
+    assert rec is not None
+    assert not log.get_summary()["unresolved"], "resolved person stayed in the queue"
+    assert rec.duration_sec >= 44, f"back-dated dwell lost: {rec.duration_sec}"
+    assert rec.status == "present", rec.status
+    assert rec.resolved_from == "person1"
+
+    assert log.resolve(4, "Rishit", "11825210004") is None, "resolved twice"
+
+
+def test_session_close_finalises_everyone():
+    """
+    The last visit stays open until something closes it, so a saved report used
+    to claim the whole class was still in the room.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_close")
+    _walk_past(log, _Det(name="Krish", roll="K1"), 1000.0, seconds=40.0)
+    _walk_past(log, _Det(track_id=8, observations=9), 1000.0, seconds=40.0)
+    assert log.records["K1"].is_present
+
+    log.close_session()
+    rec = log.records["K1"]
+    assert not rec.is_present and rec.exit_time, "open visit survived the session end"
+    assert rec.status == "left", rec.status
+    assert not log.unresolved[8].is_present
+    dwell = rec.duration_sec
+    log.close_session()
+    assert rec.duration_sec == dwell, "closing twice changed the totals"
+
+
+def test_recognised_face_clears_its_own_unresolved_entry():
+    """
+    Someone unrecognised for the first few seconds and then matched must not be
+    left in the review queue as a phantom stranger.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_unresolved_clear")
+    _walk_past(log, _Det(track_id=4, observations=9), 1000.0, seconds=5.0)
+    assert log.unresolved
+
+    log.process_detections([_Det(track_id=4, name="Krish", roll="K1")], 0, 1006.0)
+    assert not log.unresolved, "matched face left behind an unresolved entry"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

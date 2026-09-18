@@ -92,8 +92,18 @@ class Config:
     # whose ID gets handed to someone else keeps the old name. Body tracking is
     # the real fix; this is the knob until then.
     track_lost_sec: float = 8.0
-    entry_cooldown_sec: float = 30.0    # min seconds between repeated entry logs
-    absent_after_sec: float = 300.0     # mark absent after 5 min of no detection
+    # Attendance is dwell-based: you are present once you have accumulated this
+    # much time inside a zone, across however many visits. Walking past the door
+    # no longer marks you present, which the old "seen in 3 frames" rule did.
+    min_dwell_sec: float = 30.0
+    # A visit stays open across gaps shorter than this, so the gap is credited as
+    # dwell. Deliberately generous: in a classroom a student with their head down
+    # or turned away loses their face for a minute at a time and is still sitting
+    # there. Too short and their dwell is shredded into uncreditable slivers; too
+    # long and someone who walked out keeps accruing time.
+    exit_grace_sec: float = 60.0
+    # No face for this long inside an open visit = possibly covering it.
+    hiding_alert_after_sec: float = 15.0
     spoof_pixel_movement_thresh: float = 1.5  # motion heuristic threshold
     spoof_frame_count: int = 15         # frames to check for motion
     unknown_face_alert: bool = True

@@ -10,6 +10,8 @@
   const stopBtn = document.getElementById('stop-btn');
   const statusPill = document.getElementById('live-status-pill');
   const attendeeList = document.getElementById('attendee-list');
+  const unresolvedList = document.getElementById('unresolved-list');
+  const unresolvedCount = document.getElementById('unresolved-count');
   const alertList = document.getElementById('alert-list');
   const statFps = document.getElementById('stat-fps');
   const statInf = document.getElementById('stat-inf');
@@ -56,21 +58,34 @@
     }
   }
 
+  function dwellText(sec) {
+    if (sec < 60) return `${Math.round(sec)}s`;
+    return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`;
+  }
+
+  // Status comes from the server so the badge can never disagree with the record.
+  const STATUS_BADGE = { present: 'badge-green', left: 'badge-neutral', brief: 'badge-amber' };
+  const STATUS_LABEL = { present: 'Present', left: 'Left', brief: 'Too brief' };
+
   function renderAttendance(summary) {
     statPresent.textContent = summary.present_now || 0;
     statAlerts.textContent = summary.alerts || 0;
+    const rank = { present: 0, left: 1, brief: 2 };
     const persons = (summary.persons || []).slice().sort((a, b) => {
-      if (a.present !== b.present) return a.present ? -1 : 1;
+      if (a.status !== b.status) return (rank[a.status] ?? 3) - (rank[b.status] ?? 3);
       return a.name.localeCompare(b.name);
     });
     attendeeList.innerHTML = persons.length ? persons.map(p => `
       <div class="person-row">
         <div class="person-info">
-          <div class="n">${escapeHtml(p.name)}</div>
-          <div class="r">${escapeHtml(p.roll)} · in ${escapeHtml(p.entry || '--')}${p.exit ? ' → ' + escapeHtml(p.exit) : ''}</div>
+          <div class="n">${escapeHtml(p.name)}${p.resolved_from ? ' <span class="r">(was ' + escapeHtml(p.resolved_from) + ')</span>' : ''}</div>
+          <div class="r">${escapeHtml(p.roll)} · in ${escapeHtml(p.entry || '--')}${p.exit ? ' → ' + escapeHtml(p.exit) : ''}
+            · ${dwellText(p.dwell_sec || 0)}${p.visits > 1 ? ' over ' + p.visits + ' visits' : ''}</div>
         </div>
-        <span class="badge ${p.present ? 'badge-green' : 'badge-neutral'}">${p.present ? 'Present' : 'Left'}</span>
+        <span class="badge ${STATUS_BADGE[p.status] || 'badge-neutral'}">${STATUS_LABEL[p.status] || p.status}</span>
       </div>`).join('') : '<div class="empty-state"><span>No one detected yet.</span></div>';
+
+    renderUnresolved(summary.unresolved || []);
 
     const alerts = (summary.alerts_log || []).slice().reverse().slice(0, 15);
     alertList.innerHTML = alerts.length ? alerts.map(a => `
@@ -79,6 +94,74 @@
         <div class="a-type ${a.type}">${a.type.replace(/_/g, ' ')}</div>
         <div class="a-detail">${escapeHtml(a.details)}</div>
       </div>`).join('') : '<div class="empty-state"><span>No alerts.</span></div>';
+  }
+
+  function renderUnresolved(queue) {
+    if (!unresolvedList) return;
+    unresolvedCount.textContent = queue.length;
+    if (!queue.length) {
+      unresolvedList.innerHTML = '<div class="empty-state"><span>Nobody to review.</span></div>';
+      return;
+    }
+    // Re-rendering while someone is mid-typing would wipe what they typed.
+    if (unresolvedList.contains(document.activeElement)) return;
+
+    unresolvedList.innerHTML = queue.map(u => `
+      <div class="person-row unresolved-row" data-track="${u.track_id}">
+        ${u.crop ? `<img class="person-thumb" src="${u.crop}?t=${Math.round((u.dwell_sec || 0) * 10)}" alt="${escapeHtml(u.label)}">` : ''}
+        <div class="person-info">
+          <div class="n">${escapeHtml(u.label)}
+            <span class="badge ${u.needs_action ? 'badge-amber' : 'badge-neutral'}">${u.present ? 'in room' : 'gone'}</span>
+          </div>
+          <div class="r">in ${escapeHtml(u.entry || '--')} · ${dwellText(u.dwell_sec || 0)}${u.needs_action ? ' · needs a decision' : ' · too brief to count'}</div>
+          <div class="resolve-fields">
+            <input type="text" class="resolve-name" placeholder="Name">
+            <input type="text" class="resolve-roll" placeholder="Roll / ID">
+            <button class="btn btn-primary btn-sm resolve-btn">Mark</button>
+          </div>
+        </div>
+      </div>`).join('');
+  }
+
+  async function refreshUnresolved() {
+    try {
+      const d = await (await fetch('/api/live/unresolved')).json();
+      renderUnresolved(d.unresolved || []);
+    } catch (err) { /* nothing to show is not an error */ }
+  }
+
+  if (unresolvedList) {
+    unresolvedList.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.resolve-btn');
+      if (!btn) return;
+      const row = btn.closest('.unresolved-row');
+      const name = row.querySelector('.resolve-name').value.trim();
+      const roll = row.querySelector('.resolve-roll').value.trim();
+      if (!name || !roll) { row.querySelector('.resolve-name').focus(); return; }
+      btn.disabled = true;
+      const res = await fetch('/api/live/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ track_id: Number(row.dataset.track), name, roll }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        row.remove();
+        unresolvedCount.textContent = document.querySelectorAll('.unresolved-row').length;
+      } else {
+        // Never alert() here: a modal blocks the polling loop that drives the
+        // whole page, and the feed freezes behind it.
+        btn.disabled = false;
+        row.querySelector('.r').textContent = data.error || 'Could not save.';
+      }
+    });
+
+    // Typing in a field must survive the poll that would otherwise re-render it.
+    unresolvedList.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.matches('.resolve-name, .resolve-roll')) {
+        e.target.closest('.unresolved-row').querySelector('.resolve-btn').click();
+      }
+    });
   }
 
   async function tick() {
@@ -318,12 +401,12 @@
       const d = await (await fetch('/api/live/stream_status')).json();
       if (d.error) { camStatus.textContent = d.error; await camStop(); return; }
       if (d.summary) {
-        const present = document.getElementById('stat-present');
-        const alerts = document.getElementById('stat-alerts');
-        if (present) present.textContent = d.summary.present_now ?? 0;
-        if (alerts) alerts.textContent = d.summary.alerts ?? 0;
-        const names = [...new Set((d.summary.persons || []).map(p => p.name).filter(n => n && n !== 'Unknown'))];
-        if (names.length) camStatus.textContent = 'Present: ' + names.join(', ');
+        // The CCTV path used to render its own thinner version of this, so the
+        // attendance log and review queue stayed empty on the stream everyone
+        // actually uses. Same renderer for both sources now.
+        renderAttendance(d.summary);
+        const names = (d.summary.persons || []).filter(p => p.status === 'present').map(p => p.name);
+        camStatus.textContent = names.length ? 'Present: ' + names.join(', ') : 'Watching…';
       }
       if (!d.running) { camStatus.textContent = 'Stream ended.'; await camStop(); return; }
     } catch (err) { /* transient poll failure is not fatal */ }
@@ -338,7 +421,10 @@
     camBtn.textContent = 'Connect';
     try {
       const d = await (await fetch('/api/live/stream_stop', { method: 'POST' })).json();
-      camStatus.textContent = d.session ? `Stopped. Log saved as ${d.session}.` : 'Stopped.';
+      camStatus.textContent = d.session
+        ? `Stopped. Log saved as ${d.session}.${d.unresolved ? ` ${d.unresolved} still need naming.` : ''}`
+        : 'Stopped.';
+      await refreshUnresolved();   // the queue outlives the session; keep showing it
     } catch (err) { camStatus.textContent = 'Stopped.'; }
   }
 
@@ -493,6 +579,7 @@
 
   window.addEventListener('resize', drawPolygon);
   refreshZones();
+  refreshUnresolved();   // a reload after class must still show who needs naming
 
   // The stream lives on the server, so a page refresh leaves it running with the
   // client unaware — reattach instead of reporting "already running".

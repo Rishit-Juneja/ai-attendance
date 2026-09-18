@@ -1,10 +1,17 @@
 """
-Attendance logger: tracks entry/exit timestamps, computes duration,
-logs anomalies (spoof, unknown faces, hiding face).
+Attendance logger.
+
+Presence is DWELL-based, not sighting-based. Being seen does not make you
+present; accumulating `min_dwell_sec` inside a zone does. A visit stays open
+across gaps shorter than `exit_grace_sec`, so a student whose face is hidden for
+a minute keeps accruing time instead of being logged out and back in.
+
+Faces that never match the gallery do not vanish — they become `person1..N` in
+the unresolved queue with the same dwell accounting, and a teacher assigns the
+real identity afterwards via resolve(), which back-dates the attendance.
 """
 import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -12,20 +19,87 @@ from pathlib import Path
 from .config import LOGS_DIR
 
 
+def _hms(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
 @dataclass
-class PersonRecord:
-    name: str
-    roll: str
+class Visit:
+    """One continuous stay. `last_seen` is the last frame the person was in shot."""
+    entered: float
+    last_seen: float
+    zone: str = ""
+    closed: bool = False
+
+    @property
+    def seconds(self) -> float:
+        return max(0.0, self.last_seen - self.entered)
+
+
+@dataclass
+class _Dwelling:
+    """
+    Everything derived from a list of visits. Shared because a known person and
+    an unresolved stranger are counted by exactly the same rules — the only
+    difference is whether we have a name for them yet.
+    """
     zone: str = ""          # zone they were last counted in
-    first_seen: float = 0.0
-    last_seen: float = 0.0
-    entry_time: str = ""
-    exit_time: str = ""
-    duration_sec: float = 0.0
-    is_present: bool = True
     detection_count: int = 0
+    visits: list[Visit] = field(default_factory=list)
+
+    @property
+    def duration_sec(self) -> float:
+        """Time in zone summed across visits. Gaps between visits don't count."""
+        return sum(v.seconds for v in self.visits)
+
+    @property
+    def is_present(self) -> bool:
+        """In the room right now (a visit is open)."""
+        return bool(self.visits) and not self.visits[-1].closed
+
+    @property
+    def first_seen(self) -> float:
+        return self.visits[0].entered if self.visits else 0.0
+
+    @property
+    def last_seen(self) -> float:
+        return self.visits[-1].last_seen if self.visits else 0.0
+
+    @property
+    def entry_time(self) -> str:
+        return _hms(self.first_seen) if self.visits else ""
+
+    @property
+    def exit_time(self) -> str:
+        closed = [v for v in self.visits if v.closed]
+        return _hms(closed[-1].last_seen) if closed else ""
+
+
+@dataclass
+class PersonRecord(_Dwelling):
+    name: str = ""
+    roll: str = ""
     spoof_flags: int = 0
+    resolved_from: str = "" # set when a teacher named this person from the queue
     anomaly_flags: list = field(default_factory=list)
+    min_dwell_sec: float = 30.0
+
+    @property
+    def status(self) -> str:
+        if self.duration_sec >= self.min_dwell_sec:
+            return "present" if self.is_present else "left"
+        # Seen, but not for long enough to count. Distinct from absent: absent
+        # means never seen at all, which this class cannot observe.
+        return "brief"
+
+
+@dataclass
+class Unresolved(_Dwelling):
+    """A tracked person who never matched the gallery."""
+    label: str = ""         # person1, person2, ...
+    track_id: int = 0
+    crop_path: str = ""
+    crop_area: int = 0      # biggest face seen so far, so the teacher gets the best shot
 
 
 @dataclass
@@ -57,17 +131,17 @@ class AttendanceLogger:
         self.log_dir = LOGS_DIR / self.session_name
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        # These were hardcoded 30.0 / 300 here while config.py defined
-        # entry_cooldown_sec and absent_after_sec that nothing ever read.
         if config is None:
             from .config import DEFAULT_CONFIG as config
-        self.cooldown_sec = config.entry_cooldown_sec
-        self.absent_after_sec = config.absent_after_sec
+        self.min_dwell_sec = config.min_dwell_sec
+        self.exit_grace_sec = config.exit_grace_sec
+        self.hiding_alert_after_sec = config.hiding_alert_after_sec
 
-        self.records: dict[str, PersonRecord] = {}  # keyed by roll
+        self.records: dict[str, PersonRecord] = {}      # keyed by roll
+        self.unresolved: dict[int, Unresolved] = {}     # keyed by track_id
+        self._person_seq = 0
         self.alerts: list[Alert] = []
         self.frame_log: list[dict] = []
-        self._entry_cooldown: dict[str, float] = {}
 
         # One row per (alert_type, subject) per session. Without this, an
         # unrecognised face standing in shot raised an alert on every analysed
@@ -79,12 +153,14 @@ class AttendanceLogger:
         from .zones import load_zones
         self.zones_active = bool(load_zones())
 
-        # Face hiding detection: track consecutive frames where known person is absent
-        self._recently_present: dict[str, float] = {}  # roll → last timestamp seen
+    # ---------------- ingestion ----------------
 
-    def process_detections(self, detections: list, frame_idx: int, timestamp: float):
-        """Process pipeline detections into attendance records."""
-        present_rolls = set()
+    def process_detections(self, detections: list, frame_idx: int, timestamp: float,
+                           frame=None):
+        """
+        Fold one analysed frame into the records. `frame` is optional and only
+        used to save a face crop for the unresolved queue.
+        """
         active_bboxes = []
 
         for det in detections:
@@ -95,100 +171,156 @@ class AttendanceLogger:
             if self.zones_active and not det.zone:
                 continue
 
-            # Collect bboxes for overlap detection
             active_bboxes.append(det.bbox)
 
-            if det.name == "Unknown":
-                # Wait for the embedding window to fill before calling someone a
-                # stranger — see MIN_OBS_BEFORE_UNKNOWN_ALERT.
-                if getattr(det, "observations", 0) >= MIN_OBS_BEFORE_UNKNOWN_ALERT:
-                    self._log_alert("unknown_face", det.track_id,
-                                    f"Unrecognized face (score={det.match_score:.3f})",
-                                    key=str(det.track_id), severity="warn")
-                continue
-
-            roll = det.roll
-
-            # A spoofed face must not mark anybody present. This used to fall
-            # through and log attendance anyway — is_spoof only coloured the box
-            # red, so holding up a printed photo registered that person as here.
+            # A spoofed face must not accrue dwell for anybody, named or not.
             if det.is_spoof:
+                who = f"{det.name} ({det.roll})" if det.name != "Unknown" else f"track {det.track_id}"
                 self._log_alert("spoof", det.track_id,
-                                f"{det.name} ({roll}): spoof detected, "
-                                f"liveness={det.liveness_score:.3f} — attendance NOT logged",
-                                key=roll, severity="critical")
-                if roll in self.records:
-                    self.records[roll].spoof_flags += 1
-                    self.records[roll].anomaly_flags.append(
-                        f"spoof@{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}")
+                                f"{who}: spoof detected, liveness={det.liveness_score:.3f}"
+                                f" — attendance NOT logged",
+                                key=det.roll or str(det.track_id), severity="critical")
+                rec = self.records.get(det.roll)
+                if rec is not None:
+                    rec.spoof_flags += 1
+                    rec.anomaly_flags.append(f"spoof@{_hms(timestamp)}")
                 continue
 
-            present_rolls.add(roll)
-            self._recently_present[roll] = timestamp
-            now_str = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+            if det.name == "Unknown":
+                self._touch_unresolved(det, timestamp, frame)
+                continue
 
-            if roll not in self.records:
-                self.records[roll] = PersonRecord(
-                    name=det.name,
-                    roll=roll,
-                    first_seen=timestamp,
-                    entry_time=now_str,
-                )
+            rec = self._record_for(det.name, det.roll)
+            self._touch(rec, det.zone, timestamp)
 
-            rec = self.records[roll]
-            rec.last_seen = timestamp
-            rec.is_present = True
-            rec.detection_count += 1
-            rec.zone = det.zone
+            # Someone identified here cancels their own unresolved entry: the
+            # track was a stranger only until the face finally matched.
+            self.unresolved.pop(det.track_id, None)
 
-            # Entry logging with cooldown
-            if roll not in self._entry_cooldown or \
-               (timestamp - self._entry_cooldown[roll]) > self.cooldown_sec:
-                if rec.detection_count <= 3:  # likely an entry
-                    rec.entry_time = now_str
-                self._entry_cooldown[roll] = timestamp
+        self._expire(timestamp)
 
-        # Face hiding detection: known person was recently present but face disappeared
-        # This suggests they're covering their face while still in the room
-        for roll, rec in self.records.items():
-            if roll not in present_rolls and rec.is_present:
-                last_seen = self._recently_present.get(roll, 0)
-                elapsed = timestamp - last_seen
-                # Absent long enough to be odd, but not long enough to have left.
-                # Deduped by roll, so this states itself once per person.
-                if 10 < elapsed < self.absent_after_sec:
-                    self._log_alert("face_hiding", 0,
-                                    f"{rec.name} ({roll}): face disappeared after being present, possible hiding",
-                                    key=roll, severity="warn")
-                    rec.anomaly_flags.append(f"face_hiding@{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}")
-                elif elapsed > self.absent_after_sec:  # long gone → mark absent
-                    rec.is_present = False
-                    rec.exit_time = datetime.fromtimestamp(rec.last_seen).strftime("%H:%M:%S")
-                    rec.duration_sec = rec.last_seen - rec.first_seen
-
-        # Multiple overlapping faces detection:
-        # Two or more bboxes with high IoU but different track IDs = possible photo/screen spoof
+        # Multiple overlapping faces: two bboxes with high IoU but different
+        # track IDs = possible photo/screen spoof.
         if len(active_bboxes) >= 2:
             self._check_overlapping_faces(active_bboxes, detections, timestamp)
 
+    def _record_for(self, name: str, roll: str) -> PersonRecord:
+        rec = self.records.get(roll)
+        if rec is None:
+            rec = PersonRecord(name=name, roll=roll, min_dwell_sec=self.min_dwell_sec)
+            self.records[roll] = rec
+        return rec
+
+    def _touch(self, rec: _Dwelling, zone: str, timestamp: float):
+        """Extend the open visit, or start a new one."""
+        rec.zone = zone
+        rec.detection_count += 1
+        if rec.visits and not rec.visits[-1].closed:
+            rec.visits[-1].last_seen = timestamp
+            rec.visits[-1].zone = zone
+        else:
+            rec.visits.append(Visit(entered=timestamp, last_seen=timestamp, zone=zone))
+
+    def _touch_unresolved(self, det, timestamp: float, frame=None):
+        entry = self.unresolved.get(det.track_id)
+        if entry is None:
+            # Numbered by how many have ever appeared, not by dict size, so
+            # labels never get reused after one is resolved away.
+            self._person_seq += 1
+            entry = Unresolved(label=f"person{self._person_seq}", track_id=det.track_id)
+            self.unresolved[det.track_id] = entry
+        self._touch(entry, det.zone, timestamp)
+        self._save_crop(entry, det, frame)
+
+        # Wait for the embedding window to fill before calling someone a
+        # stranger — see MIN_OBS_BEFORE_UNKNOWN_ALERT.
+        if getattr(det, "observations", 0) >= MIN_OBS_BEFORE_UNKNOWN_ALERT:
+            self._log_alert("unknown_face", det.track_id,
+                            f"{entry.label}: unrecognised face "
+                            f"(score={det.match_score:.3f}) — awaiting review",
+                            key=str(det.track_id), severity="warn")
+
+    def _save_crop(self, entry: Unresolved, det, frame):
+        """Keep the largest face crop seen for this track — the teacher's evidence."""
+        if frame is None:
+            return
+        x1, y1, x2, y2 = (int(v) for v in det.bbox)
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        if area <= entry.crop_area:
+            return
+        import cv2
+        h, w = frame.shape[:2]
+        pad = int(0.35 * max(x2 - x1, y2 - y1))  # context helps a human far more than a tight crop
+        crop = frame[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
+        if crop.size == 0:
+            return
+        out_dir = self.log_dir / "unresolved"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{entry.label}.jpg"
+        if cv2.imwrite(str(path), crop):
+            entry.crop_path = str(path)
+            entry.crop_area = area
+
+    def _expire(self, now: float):
+        """Close visits whose gap has outlived the grace period, and flag hiding."""
+        for rec in list(self.records.values()) + list(self.unresolved.values()):
+            if not rec.visits or rec.visits[-1].closed:
+                continue
+            visit = rec.visits[-1]
+            elapsed = now - visit.last_seen
+            if elapsed > self.exit_grace_sec:
+                visit.closed = True
+            elif elapsed > self.hiding_alert_after_sec and isinstance(rec, PersonRecord):
+                # Still inside the visit, so dwell keeps counting — this is a
+                # heads-up, not an exit.
+                self._log_alert("face_hiding", 0,
+                                f"{rec.name} ({rec.roll}): face gone {int(elapsed)}s "
+                                f"while still counted present",
+                                key=rec.roll, severity="warn")
+
+    def close_session(self):
+        """
+        Class is over. Close every open visit so exit times and totals are final
+        — without this the last visit stays open forever and the saved report
+        shows everybody still in the room.
+        """
+        for rec in list(self.records.values()) + list(self.unresolved.values()):
+            if rec.visits and not rec.visits[-1].closed:
+                rec.visits[-1].closed = True
+
+    # ---------------- teacher review ----------------
+
+    def resolve(self, track_id: int, name: str, roll: str) -> PersonRecord | None:
+        """
+        Assign a real identity to an unresolved person. Their dwell is merged into
+        the named record — so someone who sat through the class with their face
+        covered gets credited for the whole time, not from the moment of naming.
+        """
+        entry = self.unresolved.pop(track_id, None)
+        if entry is None:
+            return None
+        rec = self._record_for(name, roll)
+        rec.visits.extend(entry.visits)
+        rec.visits.sort(key=lambda v: v.entered)
+        rec.detection_count += entry.detection_count
+        rec.zone = rec.zone or entry.zone
+        rec.resolved_from = entry.label
+        return rec
+
+    # ---------------- alerts ----------------
+
     def _check_overlapping_faces(self, bboxes, detections, timestamp):
         """Flag when multiple face bboxes significantly overlap (potential spoof)."""
-        import numpy as np
         for i in range(len(bboxes)):
             for j in range(i + 1, len(bboxes)):
                 b1, b2 = bboxes[i], bboxes[j]
-                # Compute IoU
-                xa = max(b1[0], b2[0])
-                ya = max(b1[1], b2[1])
-                xb = min(b1[2], b2[2])
-                yb = min(b1[3], b2[3])
+                xa, ya = max(b1[0], b2[0]), max(b1[1], b2[1])
+                xb, yb = min(b1[2], b2[2]), min(b1[3], b2[3])
                 inter = max(0, xb - xa) * max(0, yb - ya)
                 area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
                 area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
-                union = area1 + area2 - inter
-                iou = inter / max(union, 1e-6)
+                iou = inter / max(area1 + area2 - inter, 1e-6)
 
-                # If IoU > 0.5 and different tracks, flag it
                 if iou > 0.5:
                     d1 = detections[i] if i < len(detections) else None
                     d2 = detections[j] if j < len(detections) else None
@@ -232,16 +364,22 @@ class AttendanceLogger:
         self._alert_index[idx] = alert
         return alert
 
+    # ---------------- output ----------------
+
     def get_summary(self) -> dict:
-        present = [r for r in self.records.values() if r.is_present]
-        absent = [r for r in self.records.values() if not r.is_present]
-        spoofs = [r for r in self.records.values() if r.spoof_flags > 0]
+        confirmed = [r for r in self.records.values() if r.duration_sec >= self.min_dwell_sec]
         return {
             "session": self.session_name,
+            "min_dwell_sec": self.min_dwell_sec,
             "total_enrolled": len(self.records),
-            "present_now": len(present),
-            "absent": len(absent),
-            "spoof_detected": len(spoofs),
+            # "Present" now means dwell-confirmed AND in the room, which is what a
+            # register means. Seen-but-brief is reported separately rather than
+            # being silently counted as attendance.
+            "present_now": sum(1 for r in confirmed if r.is_present),
+            "confirmed": len(confirmed),
+            "brief": len(self.records) - len(confirmed),
+            "unresolved_count": len(self.unresolved),
+            "spoof_detected": sum(1 for r in self.records.values() if r.spoof_flags > 0),
             "alerts": len(self.alerts),
             "persons": [
                 {
@@ -250,12 +388,34 @@ class AttendanceLogger:
                     "entry": r.entry_time,
                     "exit": r.exit_time,
                     "duration_min": round(r.duration_sec / 60, 1),
+                    "dwell_sec": round(r.duration_sec, 1),
+                    "status": r.status,
                     "present": r.is_present,
+                    "visits": len(r.visits),
                     "detections": r.detection_count,
                     "spoofs": r.spoof_flags,
                     "zone": r.zone,
+                    "resolved_from": r.resolved_from,
                 }
                 for r in self.records.values()
+            ],
+            "unresolved": [
+                {
+                    "track_id": u.track_id,
+                    "label": u.label,
+                    "dwell_sec": round(u.duration_sec, 1),
+                    "duration_min": round(u.duration_sec / 60, 1),
+                    "entry": _hms(u.visits[0].entered) if u.visits else "",
+                    "exit": _hms(u.visits[-1].last_seen) if u.visits and u.visits[-1].closed else "",
+                    "present": u.is_present,
+                    "zone": u.zone,
+                    "detections": u.detection_count,
+                    "crop": f"/api/live/unresolved/{u.track_id}/crop" if u.crop_path else "",
+                    # Only worth a teacher's time if they were actually here.
+                    "needs_action": u.duration_sec >= self.min_dwell_sec,
+                }
+                for u in sorted(self.unresolved.values(),
+                                key=lambda x: -x.duration_sec)
             ],
             "alerts_log": [
                 {
@@ -290,13 +450,19 @@ class AttendanceLogger:
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Name", "Roll", "Entry", "Exit", "Duration(min)", "Present",
-                             "Detections", "Spoofs", "Zone"])
+            writer.writerow(["Name", "Roll", "Entry", "Exit", "Dwell(min)", "Status",
+                             "Visits", "Detections", "Spoofs", "Zone"])
             for r in self.records.values():
                 writer.writerow([
                     r.name, r.roll, r.entry_time, r.exit_time,
-                    round(r.duration_sec / 60, 1), r.is_present,
-                    r.detection_count, r.spoof_flags, r.zone,
+                    round(r.duration_sec / 60, 1), r.status,
+                    len(r.visits), r.detection_count, r.spoof_flags, r.zone,
+                ])
+            for u in self.unresolved.values():
+                writer.writerow([
+                    u.label, "UNRESOLVED", _hms(u.visits[0].entered) if u.visits else "",
+                    "", round(u.duration_sec / 60, 1), "unresolved",
+                    len(u.visits), u.detection_count, 0, u.zone,
                 ])
         print(f"[CSV] Saved to {path}")
         return path
