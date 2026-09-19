@@ -544,7 +544,10 @@ def api_live_frame():
 
     detections = [{
         "track_id": d.track_id,
+        # The body box when one was found, so it stays drawn while the face is
+        # hidden. face_bbox is what actually named them, drawn thinner inside.
         "bbox": d.bbox.tolist(),
+        "face_bbox": None if d.face_bbox is None else d.face_bbox.tolist(),
         "name": d.name,
         "roll": d.roll,
         "score": round(d.match_score, 3),

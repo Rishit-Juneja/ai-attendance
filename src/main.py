@@ -133,7 +133,7 @@ class AttendanceSystem:
                     if self._frame_count % 100 == 0:
                         print(
                             f"[FRAME {self._frame_count}] "
-                            f"faces={result.num_faces} "
+                            f"tracked={result.num_tracked} "
                             f"inference={result.inference_ms:.0f}ms "
                             f"fps={self._current_fps:.1f} "
                             f"present={summary.get('present_now', 0)}"

@@ -41,13 +41,12 @@ class Zone:
 
 def anchor_point(bbox) -> tuple[float, float]:
     """
-    Where a detection "stands" for containment purposes: bottom-centre of the
-    face box.
+    Where a detection "stands" for containment purposes: bottom-centre of the box.
 
-    This is the chin, not the feet — we only ever detect faces, so the body is
-    not available. For a camera looking across a room that is close enough, but
-    draw zone edges with a little margin: someone at the very boundary can read
-    as in or out depending on head tilt.
+    The pipeline passes a BODY box, so this is the feet — the honest answer to
+    "which part of the room is this person in". It degrades to the chin for a
+    face in the crowd fallback, where no body was detected; that reads as in or
+    out depending on head tilt, so draw zone edges with a little margin.
     """
     return (float(bbox[0] + bbox[2]) / 2.0, float(bbox[3]))
 

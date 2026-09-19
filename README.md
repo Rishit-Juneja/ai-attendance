@@ -5,12 +5,20 @@ SRM Inter-College AI Innovation Challenge — Facial recognition attendance from
 ## Architecture
 
 ```
-Video/Camera → [Frame Sampler] → [SCRFD Detection] → [ByteTrack] → [ArcFace Embedding] → [FAISS Match]
-                                         ↓                                      ↓
-                                  [Spoof Checker]                        [Attendance Logger]
-                                         ↓                                      ↓
-                                  [Anomaly Alerts]                     [Dashboard / Reports]
+                          ┌→ [YOLO11 Person Detect] ─→ [ByteTrack on bodies] ─┐
+Video/Camera → [Sampler] ─┤                                                   ├→ [FAISS Match]
+                          └→ [SCRFD Face Detect] ──→ [ArcFace Embedding] ─────┘        ↓
+                                     ↓                                          [Attendance Logger]
+                              [Spoof Checker] → [Anomaly Alerts]                       ↓
+                                                                              [Dashboard / Reports]
 ```
+
+**Tracking is on bodies; faces only supply identity.** A face turned away scores
+0.06 against its own enrollment — below the impostor floor — so identity cannot
+be re-derived per frame, only carried by a track. A face inside a body box is
+folded into that body's track and never counted twice. Faces belonging to no
+detected body (back rows, where bodies are occluded) get their own tracks, so a
+packed room is not reduced to the handful of people YOLO can separate.
 
 ## Quick Start
 
@@ -67,8 +75,10 @@ is what lets a distant face clear the threshold — measured on a 24px face, a
 1-photo entry scored 0.2663 (miss) against 0.3044 for a 2-photo entry.
 
 **Zones.** Draw a polygon on the live feed ("Attendance zone" on the Live page)
-and only faces standing inside it count — useful when a corridor or doorway is
-visible in shot. With no zone defined the whole frame counts, so this is opt-in.
+and only people standing inside it count — useful when a corridor or doorway is
+visible in shot. Membership is decided by the bottom-centre of the body box, so
+it is the person's feet that have to be inside, not their chin. With no zone
+defined the whole frame counts, so this is opt-in.
 Points are stored normalized 0..1 in `data/zones.json`, so a zone stays correct
 if the camera resolution changes. A zone is an *area*, not a tripwire: it answers
 "who is in the room", not "who crossed this line, which way".
@@ -82,11 +92,17 @@ Longer gaps close the visit and record an exit; coming back opens a new one and
 the totals add up across all of them. Someone who only walks past the door ends
 up as `brief` and is reported separately rather than counted present.
 
-**Unresolved queue.** A tracked face that never matches the gallery is not
-thrown away — it becomes `person1..N` with its own dwell record, its best crop,
-and its entry time, and appears under "Needs review" on the Live page. A teacher
-types a name and roll, and the time that person was already in the room is
-credited to them retroactively. This queue outlives the session on purpose:
+**Unresolved queue.** A tracked person who never matches the gallery is not
+thrown away — they become `person1..N` with their own dwell record, their best
+crop, and their entry time, and appear under "Needs review" on the Live page. A
+teacher types a name and roll, and the time that person was already in the room
+is credited to them retroactively.
+
+The same back-fill happens automatically: someone who sits facing away for forty
+seconds and then glances at the camera is credited from when they sat down, not
+from the moment they looked up. The crop prefers a face and falls back to the
+body, which is the only thing available for the people most likely to need
+review. This queue outlives the session on purpose:
 the review happens after class, and resolving someone rewrites the saved report.
 Expect it to be the normal path rather than an edge case — identification needs
 roughly a 30px face where tracking only needs a 25px body, so in a large room
@@ -117,15 +133,35 @@ Switch via `--gpu-profile` or `GPU_PROFILE=dev` env var.
    prediction plus the two-stage high/low-confidence association BYTE is named
    for. `ByteTrackWrapper` in pipeline.py adds a rolling embedding average per
    track on top, which is what lets a small CCTV face clear the match threshold
-   (0.28 → 0.46 measured on a 25px face). Activation thresholds are set below the
-   library defaults on purpose: SCRFD scores a sub-25px face at a median 0.685,
-   so the stock 0.7 would refuse to track 26% of real faces.
+   (0.28 → 0.46 measured on a 25px face). Two instances run: one on bodies, one
+   on the leftover faces.
 
-2. **FAISS in-memory**: 500 faces × 512 dimensions = ~1MB. No vector DB needed.
+   Spawn thresholds are per-tracker, because a confidence score only means
+   something within one detector. SCRFD scores a sub-25px face at a median 0.685,
+   so the library's stock 0.7 would refuse to track 26% of real faces; YOLO
+   person scores in a crowded room run 0.37–0.91, so the face-calibrated 0.5 sat
+   in the middle of the real distribution and refused a track to a third of the
+   people in the room. Both detectors emit *below* their tracker's spawn
+   threshold on purpose — those boxes cannot start a track, but BYTE's second
+   stage uses them to keep an occluded person's existing track alive.
 
-3. **Motion-based spoof detection**: Instead of requiring a separate ONNX model, we check pixel variance in the face region across frames. Real faces have micro-movements (breathing, blinking). Printed photos/screens have near-zero variance.
+2. **3 fps analysis, and why it needs bodies**: displacement measured in box
+   widths is scale-invariant. At 1 m/s a person moves 2.1 face-widths per frame
+   at 3 fps (boxes do not overlap, so no association is possible) but only 0.67
+   body-widths (they do). Bodies hold to ~1.2 m/s; beyond that a track breaks,
+   which dwell-based attendance does not care about because people who do not
+   stop are not present anyway. `test_three_fps_needs_body_boxes_not_face_boxes`
+   asserts this rather than trusting the comment.
 
-4. **Frame throttling**: Analysis runs at 2-3 fps regardless of source framerate. Display/recording runs at native FPS. This keeps GPU usage manageable on weak hardware.
+3. **FAISS in-memory**: 500 faces × 512 dimensions = ~1MB. No vector DB needed.
+
+4. **Motion-based spoof detection**: Instead of requiring a separate ONNX model, we check pixel variance in the face region across frames. Real faces have micro-movements (breathing, blinking). Printed photos/screens have near-zero variance.
+
+5. **Frame throttling**: Analysis runs at 3 fps regardless of source framerate;
+   display/recording runs at native FPS, with `BoxGlide` carrying boxes forward
+   at their measured velocity in between so the overlay stays smooth. This is not
+   only a GPU saving — the competition GPU is 10-15km away, and a full-rate
+   640x480 feed is ~5 Mbps per camera.
 
 ## Project Structure
 
@@ -133,7 +169,8 @@ Switch via `--gpu-profile` or `GPU_PROFILE=dev` env var.
 ai-attendance/
 ├── src/
 │   ├── config.py         # GPU profiles, thresholds, paths
-│   ├── pipeline.py       # Detect → Track → Embed → Match
+│   ├── pipeline.py       # Detect → Track (bodies) → Embed (faces) → Match
+│   ├── persons.py        # YOLO11 person detection + face→body association
 │   ├── antispoof.py      # Liveness/spoof detection
 │   ├── attendance.py     # Dwell-based presence, unresolved queue, alerts
 │   ├── dashboard.py      # WebSocket + Flask dashboard

@@ -136,13 +136,7 @@ def test_walking_person_survives_an_occlusion_gap():
     The bug that started this: a walking face picked up a new ID every frame, so
     the embedding window never accumulated and the name flapped.
 
-    Geometry is what matters. A ~16cm face at 1.4 m/s is ~13px/frame at 20 fps on
-    a 30px box (IoU ~0.4, associates fine) but ~2.9 face-widths/frame at 3 fps
-    (IoU 0, associates never). That is why analysis_fps moved 3 -> 20; motion
-    prediction cannot rescue the *first* association, since velocity is unknown
-    until two frames have already linked.
-
-    What prediction does buy is the gap in the middle here: three frames with no
+    Prediction is what carries the gap in the middle here: three frames with no
     detection at all, the way a person passing behind someone else looks.
     """
     from src.pipeline import ByteTrackWrapper
@@ -173,6 +167,57 @@ def test_walking_person_survives_an_occlusion_gap():
         f"only {track.observations} observations survived — the ID is being dropped "
         "and re-created as the person moves"
     )
+
+
+def test_three_fps_needs_body_boxes_not_face_boxes():
+    """
+    The geometric reason analysis_fps could drop 20 -> 3, asserted rather than
+    claimed in a comment.
+
+    Displacement measured in box widths is scale-invariant — it depends on the
+    subject's real width, not on how far away the camera is. At 1.0 m/s and 3 fps
+    a person moves 33cm per frame, which is 2.1 widths of a 16cm face (boxes do
+    not overlap at all, IoU 0, no association is possible) but 0.67 widths of a
+    50cm body, which still overlaps enough to link.
+
+    That first link is the whole problem: velocity is unknown until two frames
+    have already been associated, so Kalman prediction cannot rescue it.
+
+    Measured ceiling, swept in this same harness: bodies hold to ~1.2 m/s and
+    break at 1.4 m/s (a brisk outdoor stride). Faces hold at no speed at all.
+    Someone jogging through the door will be a new track — acceptable, because
+    dwell-based attendance does not care about people who do not stop. If that
+    ever stops being acceptable, raise analysis_fps; the rate and the choice of
+    box are one decision, not two.
+    """
+    from src.pipeline import ByteTrackWrapper
+
+    rng = np.random.default_rng(7)
+    emb = _unit(rng)
+    px_per_m = 200
+    step = 1.0 / 3 * px_per_m        # 1.0 m/s, normal indoor walking pace
+
+    def run(width_m, height_m):
+        tracker = ByteTrackWrapper(embed_window=30, frame_rate=3)
+        for i in range(10):
+            x = 10.0 + i * step
+            tracker.update([np.array([x, 40, x + width_m * px_per_m,
+                                      40 + height_m * px_per_m], dtype=np.float32)],
+                           [emb], [0.9])
+        return tracker
+
+    faces = run(0.16, 0.20)
+    assert not faces.tracks, (
+        "a face box held a track across 3 fps walking motion — that should be "
+        "geometrically impossible, so check the test before trusting the result"
+    )
+
+    bodies = run(0.50, 1.75)
+    assert len(bodies.tracks) == 1, (
+        f"{len(bodies.tracks)} body tracks for one walker at 3 fps — "
+        "body tracking is not surviving the rate drop"
+    )
+    assert _only_track(bodies).observations >= 8, _only_track(bodies).observations
 
 
 def test_lost_track_is_not_reported_as_present():
@@ -269,16 +314,168 @@ def test_identity_is_sticky_once_matched():
     assert set(names) == {"WebPerson"}, f"identity flapped: {names}"
 
 
+class _FakePersonDetector:
+    """Yields a scripted list of body boxes per frame, like PersonDetector."""
+
+    def __init__(self, frames, score=0.9):
+        self.frames = frames
+        self.score = score
+        self.i = 0
+
+    def detect(self, _frame):
+        from src.persons import PersonBox
+        boxes = self.frames[min(self.i, len(self.frames) - 1)]
+        self.i += 1
+        return [PersonBox(bbox=np.asarray(b, dtype=np.float32), score=self.score)
+                for b in boxes]
+
+
+def test_face_is_not_lost_with_a_body_that_never_tracked():
+    """
+    Found on real photos: ByteTrack only spawns tracks from its high-confidence
+    bucket, so a body below the spawn threshold is reported by nothing. The face
+    inside it had already been assigned to that body and removed from the face
+    path, so the person vanished from both — 3 of 11 people on pic1, 7 of 15 on
+    pic3, silently absent from the register.
+
+    A face must fall through to the face tracker whenever its body did not
+    actually produce a track.
+    """
+    from src.config import Config
+    from src.pipeline import BODY_SPAWN_THRESHOLD, Pipeline
+
+    idx, meta, vecs = _fake_gallery()
+    body = [100, 100, 200, 400]
+    face = _FakeFace([130, 110, 170, 150], vecs[0])
+
+    cfg = Config(gpu_profile="dev")
+    p = Pipeline(cfg, embedder=_FakeEmbedder([[face]]),
+                 # Detected, but too weak to start a body track.
+                 person_detector=_FakePersonDetector([[body]],
+                                                     score=BODY_SPAWN_THRESHOLD - 0.05))
+    p.load_gallery(idx, meta, live_only=True)
+
+    for _ in range(4):
+        dets = p.process_frame(np.zeros((480, 640, 3), dtype=np.uint8)).detections
+
+    assert len(dets) == 1, f"expected exactly one person, got {len(dets)}"
+    assert dets[0].name == "WebPerson", dets[0].name
+
+
+def test_identity_survives_the_face_disappearing():
+    """
+    The requirement this whole design exists for: once a face names someone,
+    they keep that name while turned around or covered up.
+
+    A face turned away scored 0.06 against its own enrollment — below the ~0.25
+    impostor floor — so no threshold can re-derive identity per frame. It has to
+    be carried by the body track.
+    """
+    from src.config import Config
+    from src.pipeline import Pipeline
+
+    idx, meta, vecs = _fake_gallery()
+    known = vecs[0]
+
+    body = [100, 100, 200, 400]
+    face = [130, 110, 170, 150]           # inside the body box
+
+    # Three frames with a visible face, then six with the body only.
+    face_frames = [[_FakeFace(face, known)]] * 3 + [[]] * 6
+    body_frames = [[body]] * 9
+
+    cfg = Config(gpu_profile="dev")
+    p = Pipeline(cfg, embedder=_FakeEmbedder(face_frames),
+                 person_detector=_FakePersonDetector(body_frames))
+    p.load_gallery(idx, meta, live_only=True)
+
+    names, ids = [], []
+    for _ in range(9):
+        for d in p.process_frame(np.zeros((480, 640, 3), dtype=np.uint8)).detections:
+            names.append(d.name)
+            ids.append(d.track_id)
+
+    assert names[-1] == "WebPerson", (
+        f"lost the name once the face went away: {names}")
+    assert len(set(ids)) == 1, f"the body track was not kept intact: {ids}"
+    assert names.count("WebPerson") >= 6, (
+        f"name did not persist across the covered frames: {names}")
+
+
+def test_a_face_inside_a_body_is_one_person_not_two():
+    """
+    Bodies and faces are tracked by two separate trackers. A face contained in a
+    body box must be folded into that body's track — reporting both would make
+    one attendee two, and double-count the room.
+    """
+    from src.config import Config
+    from src.pipeline import Pipeline
+
+    idx, meta, vecs = _fake_gallery()
+
+    body = [100, 100, 200, 400]
+    inside = _FakeFace([130, 110, 170, 150], vecs[0])
+    outside = _FakeFace([400, 100, 440, 140], vecs[0])   # back row, no body found
+
+    cfg = Config(gpu_profile="dev")
+    p = Pipeline(cfg, embedder=_FakeEmbedder([[inside, outside]]),
+                 person_detector=_FakePersonDetector([[body]]))
+    p.load_gallery(idx, meta, live_only=True)
+
+    for _ in range(4):
+        dets = p.process_frame(np.zeros((480, 640, 3), dtype=np.uint8)).detections
+
+    assert len(dets) == 2, f"expected body + orphan face, got {len(dets)}"
+    tracked_body = [d for d in dets if d.bbox[3] > 300]
+    assert len(tracked_body) == 1, "the contained face was counted as its own person"
+    assert tracked_body[0].face_bbox is not None, "body track lost its face box"
+    # Distinct namespaces, or the two trackers' id 1s collide into one record.
+    assert len({d.track_id for d in dets}) == 2, [d.track_id for d in dets]
+
+
+def test_zone_membership_uses_feet_not_chin():
+    """
+    Zone containment reads the bottom-centre of the reported box. Now that the
+    box is a body, that is the person's feet — the chin anchor put a tall person
+    in the row in front of the one they were standing in.
+    """
+    from src.config import Config
+    from src.pipeline import Pipeline
+    from src.zones import Zone
+
+    idx, meta, vecs = _fake_gallery()
+
+    # Zone covers the lower half of the frame only.
+    body = [100, 100, 200, 400]           # feet at y=400 (inside), head at y=100 (outside)
+    face = [130, 110, 170, 150]
+
+    cfg = Config(gpu_profile="dev")
+    p = Pipeline(cfg, embedder=_FakeEmbedder([[_FakeFace(face, vecs[0])]]),
+                 person_detector=_FakePersonDetector([[body]]))
+    p.load_gallery(idx, meta, live_only=True)
+    p.zones = [Zone("floor", [[0.0, 0.5], [1.0, 0.5], [1.0, 1.0], [0.0, 1.0]])]
+
+    for _ in range(3):
+        dets = p.process_frame(np.zeros((480, 640, 3), dtype=np.uint8)).detections
+
+    assert dets and dets[0].zone == "floor", (
+        f"body at y=100..400 in a 480px frame should stand in 'floor', got "
+        f"{dets[0].zone if dets else 'no detections'}")
+
+
 class _Det:
     """Minimal stand-in for pipeline.Detection."""
 
     def __init__(self, name="Unknown", roll="", track_id=1, score=0.9,
-                 is_spoof=False, observations=30, zone=""):
+                 is_spoof=False, observations=30, zone="", face_visible=True):
         self.name, self.roll, self.track_id = name, roll, track_id
         self.match_score, self.is_spoof = score, is_spoof
         self.liveness_score, self.observations = 0.1 if is_spoof else 0.9, observations
         self.zone = zone
-        self.bbox = np.array([0, 0, 40, 50], dtype=np.float32)
+        self.bbox = np.array([0, 0, 40, 120], dtype=np.float32)       # body
+        # None models someone turned around or covered up: the body is tracked,
+        # the face contributes nothing this frame.
+        self.face_bbox = np.array([5, 0, 35, 35], dtype=np.float32) if face_visible else None
 
 
 def test_spoofed_face_does_not_mark_attendance():
@@ -581,6 +778,36 @@ def test_recognised_face_clears_its_own_unresolved_entry():
 
     log.process_detections([_Det(track_id=4, name="Krish", roll="K1")], 0, 1006.0)
     assert not log.unresolved, "matched face left behind an unresolved entry"
+
+
+def test_covered_dwell_is_back_filled_when_the_face_finally_matches():
+    """
+    The payoff of tracking bodies. Someone sits down facing away, is person1 for
+    40 seconds, then glances at the camera and matches. They must be credited
+    from when they sat down — not from the moment they happened to look up.
+
+    The old code popped the unresolved entry and threw its dwell away, so a
+    student covered for most of the class read as 'brief'.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_backfill")
+    covered = _Det(track_id=4, observations=9, face_visible=False)
+    end = _walk_past(log, covered, 1000.0, seconds=40.0)
+    assert log.unresolved[4].duration_sec >= 39, log.unresolved[4].duration_sec
+
+    # Their face finally shows and matches.
+    log.process_detections([_Det(track_id=4, name="Krish", roll="K1")], 0, end)
+
+    rec = log.records["K1"]
+    assert not log.unresolved, "resolved person left in the queue"
+    assert rec.duration_sec >= 39, (
+        f"only {rec.duration_sec:.1f}s credited — the covered portion was "
+        "discarded instead of back-filled")
+    assert rec.status == "present", rec.status
+    assert rec.resolved_from == "person1", rec.resolved_from
+    assert len(rec.visits) == 1, (
+        f"{len(rec.visits)} visits — the merge split one continuous stay in two")
 
 
 if __name__ == "__main__":

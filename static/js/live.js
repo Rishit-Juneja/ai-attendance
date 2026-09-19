@@ -47,8 +47,16 @@
     for (const d of detections) {
       const [x1, y1, x2, y2] = d.bbox;
       const color = d.is_spoof ? COLOR_SPOOF : (d.name !== 'Unknown' ? COLOR_MATCH : COLOR_UNKNOWN);
+      ctx.lineWidth = 2;
       ctx.strokeStyle = color;
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      // Thin inner box on the face that supplied the identity. Absent means the
+      // person is turned away or covered and the body track is carrying them.
+      if (d.face_bbox) {
+        const [fx1, fy1, fx2, fy2] = d.face_bbox;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(fx1, fy1, fx2 - fx1, fy2 - fy1);
+      }
       const label = d.name !== 'Unknown' ? `${d.name} ${d.score.toFixed(2)}` : 'Unknown';
       const tw = ctx.measureText(label).width;
       ctx.fillStyle = color;

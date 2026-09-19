@@ -142,7 +142,11 @@ class DemoRunner:
 
                 det = Detection(
                     track_id=idx,
+                    # The CASIA loader hands us a pre-cropped face, so the crop
+                    # IS both boxes. Saying so keeps the unresolved queue saving
+                    # a face rather than reading this as a body-only sighting.
                     bbox=np.array([0, 0, 96, 96]),
+                    face_bbox=np.array([0, 0, 96, 96]),
                     embedding=emb,
                     name=name,
                     roll=roll,

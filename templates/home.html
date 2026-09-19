@@ -34,9 +34,9 @@
 <div class="card section-gap">
   <h2>Recognition pipeline</h2>
   <div class="pipeline-strip">
-    <div class="pipe-node"><div class="icon-wrap"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="12" cy="12" r="3"/></svg></div><div class="lbl">Detect</div><div class="sub">SCRFD</div></div>
+    <div class="pipe-node"><div class="icon-wrap"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="12" cy="12" r="3"/></svg></div><div class="lbl">Detect</div><div class="sub">YOLO11 + SCRFD</div></div>
     <div class="pipe-arrow"></div>
-    <div class="pipe-node"><div class="icon-wrap"><svg class="icon" viewBox="0 0 24 24"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg></div><div class="lbl">Track</div><div class="sub">ByteTrack</div></div>
+    <div class="pipe-node"><div class="icon-wrap"><svg class="icon" viewBox="0 0 24 24"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg></div><div class="lbl">Track</div><div class="sub">ByteTrack on bodies</div></div>
     <div class="pipe-arrow"></div>
     <div class="pipe-node"><div class="icon-wrap"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/></svg></div><div class="lbl">Embed</div><div class="sub">ArcFace 512d</div></div>
     <div class="pipe-arrow"></div>
@@ -44,7 +44,7 @@
     <div class="pipe-arrow"></div>
     <div class="pipe-node"><div class="icon-wrap"><svg class="icon" viewBox="0 0 24 24"><path d="M9 12.5 11 15l4.5-5.5"/><circle cx="12" cy="12" r="9"/></svg></div><div class="lbl">Log</div><div class="sub">Attendance</div></div>
   </div>
-  <p class="hint">Live camera/CCTV ingestion isn't wired up yet — the pipeline currently runs on uploaded images/video (Identify page) or your browser's webcam (Live page), sampled at 2–5 fps once a real feed is connected.</p>
+  <p class="hint">Tracking runs on <strong>bodies</strong>, analysed at 3 fps; a face only has to supply the identity once, then the body carries the name even if the person turns away or covers up. Sources: RTSP/MJPEG camera, uploaded image or video (Identify page), or your browser's webcam (Live page).</p>
 </div>
 
 <div class="grid grid-2 section-gap">

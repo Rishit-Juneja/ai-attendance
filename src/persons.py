@@ -24,6 +24,11 @@ MODEL_PATH = DATA_DIR / "models" / "yolo11n.onnx"
 PERSON_CLASS = 0          # COCO class 0 is "person"
 INPUT_SIZE = 640
 
+# The default conf_threshold is deliberately below pipeline.BODY_SPAWN_THRESHOLD.
+# Boxes in between are not junk to be filtered — they are ByteTrack's low
+# confidence bucket, which continues the track of someone who has walked behind
+# a desk. They can never start a new track, so a false positive there is inert.
+
 
 @dataclass
 class PersonBox:
@@ -55,7 +60,7 @@ def _letterbox(frame: np.ndarray, size: int = INPUT_SIZE):
 
 
 class PersonDetector:
-    def __init__(self, model_path: Path = MODEL_PATH, conf_threshold: float = 0.35,
+    def __init__(self, model_path: Path = MODEL_PATH, conf_threshold: float = 0.25,
                  nms_threshold: float = 0.5, providers=None):
         import onnxruntime as ort
 

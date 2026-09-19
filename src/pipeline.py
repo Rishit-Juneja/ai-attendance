@@ -1,6 +1,19 @@
 """
-Core pipeline: Detection (SCRFD) → Tracking (ByteTrack) → Embedding (ArcFace) → Matching (FAISS).
-The pipeline is stateless per frame — tracking state lives in the Tracker.
+Core pipeline: Detection (YOLO bodies + SCRFD faces) → Tracking (ByteTrack) →
+Embedding (ArcFace) → Matching (FAISS).
+
+Tracking runs on BODIES, and faces only supply the embedding that names one.
+A face turned away scores ~0.06 against its own enrollment — below the impostor
+floor — so identity can only be carried by a track, never re-derived per frame.
+Bodies also survive a low analysis rate: at 3 fps a walking person moves ~3 face
+widths (no IoU overlap, association impossible) but only ~0.3 body widths.
+
+A second tracker still runs on faces that fall inside no body box. Person
+detection under-counts a packed room badly — measured 8 bodies against 98 faces
+on this project's own crowd photo — so back rows would disappear entirely if
+bodies were the only path.
+
+The pipeline is stateless per frame — tracking state lives in the Trackers.
 """
 import collections
 import time
@@ -15,13 +28,29 @@ from insightface.utils import face_align
 from trackers import ByteTrackTracker
 
 from .config import Config, GPUProfile
+from .persons import PersonDetector, face_to_person
 from .zones import load_zones, zone_for
+
+# Two trackers both number their IDs from 1, and track_id is a dict key in the
+# unresolved queue, the spoof checker and BoxGlide. Without a namespace, body 4
+# and face 4 are two different people sharing one record.
+FACE_TRACK_ID_OFFSET = 1_000_000
+
+# Confidence a YOLO person box needs before it may start a new body track. Must
+# stay above PersonDetector's own floor, or its low-confidence bucket is empty
+# and ByteTrack's occlusion-rescue stage has nothing to work with.
+BODY_SPAWN_THRESHOLD = 0.35
+
+
+def _area(bbox) -> float:
+    return float(max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1]))
 
 
 @dataclass
 class Detection:
     track_id: int
-    bbox: np.ndarray        # [x1, y1, x2, y2]
+    bbox: np.ndarray        # [x1, y1, x2, y2] — the body box when one was found
+    face_bbox: np.ndarray | None = None   # None while this person's face is hidden
     embedding: np.ndarray | None = None
     name: str = "Unknown"
     roll: str = ""
@@ -29,7 +58,7 @@ class Detection:
     is_spoof: bool = False
     liveness_score: float = 1.0
     observations: int = 0     # frames averaged into this track's embedding; higher = more confident
-    zone: str = ""            # named zone containing this face, "" if none defined
+    zone: str = ""            # named zone containing this person, "" if none defined
 
 
 @dataclass
@@ -38,7 +67,7 @@ class FrameResult:
     timestamp: float
     detections: list[Detection]
     inference_ms: float = 0.0
-    num_faces: int = 0
+    num_tracked: int = 0      # people being tracked, face visible or not
 
 
 @dataclass
@@ -200,9 +229,19 @@ class ByteTrackWrapper:
     with a floor of 0.505, so the stock track_activation_threshold of 0.7 refuses
     to track 26% of real faces — and they are precisely the distant ones this
     system exists to identify.
+
+    spawn_threshold is a constructor argument because a confidence score is only
+    comparable within one detector. Applying the SCRFD-calibrated 0.5 to YOLO
+    person scores silently dropped 3 of 11 bodies on pic1 and 7 of 15 on pic3.
+
+    Detections below it are not discarded — BYTE's second association stage still
+    uses them to continue tracks that already exist, which is how an occluded
+    person keeps their ID. That is the whole reason both detectors are run with
+    a floor well below the spawn threshold.
     """
 
-    def __init__(self, max_age=30, min_hits=2, embed_window=30, frame_rate=15.0):
+    def __init__(self, max_age=30, min_hits=2, embed_window=30, frame_rate=15.0,
+                 spawn_threshold=0.5):
         self.max_age = max_age
         self.embed_window = embed_window
         self.tracks: dict[int, ByteTrackWrapper._Track] = {}
@@ -211,8 +250,12 @@ class ByteTrackWrapper:
             lost_track_buffer=max_age,
             frame_rate=frame_rate,
             minimum_consecutive_frames=min_hits,
-            track_activation_threshold=0.5,
-            high_conf_det_threshold=0.5,
+            # One number, set twice, because the library gates spawning on both:
+            # a detection must land in the high-confidence bucket AND clear the
+            # activation threshold. Setting only one of them changes nothing,
+            # which cost an afternoon to discover.
+            track_activation_threshold=spawn_threshold,
+            high_conf_det_threshold=spawn_threshold,
             minimum_iou_threshold=0.1,
         )
 
@@ -230,7 +273,7 @@ class ByteTrackWrapper:
         """
 
         __slots__ = ("id", "bbox", "_embeddings", "age", "hits",
-                     "time_since_update", "name", "roll", "last_embed_frame")
+                     "time_since_update", "name", "roll", "last_embed_frame", "src_idx")
 
         def __init__(self, tid, bbox, embedding=None, window=30):
             self.id = tid
@@ -242,6 +285,9 @@ class ByteTrackWrapper:
             self.name = "Unknown"
             self.roll = ""
             self.last_embed_frame = 0
+            # Which row of THIS frame's input list matched. Only meaningful on a
+            # track that was updated this frame, which is all update() returns.
+            self.src_idx = -1
             if embedding is not None:
                 self.add_embedding(embedding)
 
@@ -317,6 +363,7 @@ class ByteTrackWrapper:
             track.bbox = tracked.xyxy[i]
             track.hits += 1
             track.time_since_update = 0
+            track.src_idx = src
             if embeddings[src] is not None:
                 track.add_embedding(embeddings[src])
                 track.last_embed_frame = self.frame_count
@@ -339,7 +386,8 @@ class ByteTrackWrapper:
 class Pipeline:
     """End-to-end: frame → FrameResult with matched identities."""
 
-    def __init__(self, config: Config, embedder: "ArcFaceEmbedder | None" = None):
+    def __init__(self, config: Config, embedder: "ArcFaceEmbedder | None" = None,
+                 person_detector: "PersonDetector | None" = None):
         self.config = config
         profile = config.profile
 
@@ -348,7 +396,19 @@ class Pipeline:
             use_half=profile.use_half_precision,
             emb_batch=profile.emb_batch,
         )
+        # Optional: without it the pipeline degrades to the old face-only
+        # behaviour rather than refusing to start. That matters because the
+        # .onnx is a build artefact, not something in the repo.
+        if person_detector is None:
+            try:
+                person_detector = PersonDetector()
+            except Exception as exc:  # noqa: BLE001 - missing model or no ORT
+                print(f"[WARN] person detection off ({exc}). Faces only — "
+                      "identity will not survive someone turning around.")
+        self.person_detector = person_detector
+
         self.tracker = None
+        self.body_tracker = None
         self.reset_tracker()
         self.matcher = None  # lazy-loaded
         self.zones = load_zones()  # empty list = whole frame counts
@@ -365,18 +425,29 @@ class Pipeline:
         quietly omitted embed_window.
         """
         profile = self.config.profile
-        self.tracker = ByteTrackWrapper(
-            # Frames, so it has to scale with the analysis rate to stay a fixed
-            # number of seconds of tolerance. Measured on the live camera: at 2s
-            # (40 frames) turning away for ~9s destroyed the track, and the person
-            # came back nameless for 5.4s until a clean frontal view rebuilt the
-            # embedding window. Identity is sticky per track, so a longer buffer
-            # is what actually carries a name through a face being hidden.
-            max_age=int(profile.analysis_fps * self.config.track_lost_sec),
-            min_hits=2,
-            embed_window=self.config.track_embed_window,
-            frame_rate=profile.analysis_fps,
-        )
+
+        def build(spawn_threshold=0.5):
+            return ByteTrackWrapper(
+                spawn_threshold=spawn_threshold,
+                # Frames, so it has to scale with the analysis rate to stay a fixed
+                # number of seconds of tolerance. Measured on the live camera: at 2s
+                # (40 frames) turning away for ~9s destroyed the track, and the person
+                # came back nameless for 5.4s until a clean frontal view rebuilt the
+                # embedding window. Identity is sticky per track, so a longer buffer
+                # is what actually carries a name through a face being hidden.
+                max_age=max(1, int(profile.analysis_fps * self.config.track_lost_sec)),
+                min_hits=2,
+                embed_window=self.config.track_embed_window,
+                frame_rate=profile.analysis_fps,
+            )
+
+        # 0.35 for bodies, measured: YOLO person scores in a crowded room run
+        # 0.37-0.91, so the face-calibrated 0.5 sat in the middle of the real
+        # distribution and refused to start a track for a third of the people in
+        # the room. PersonDetector emits from 0.25, leaving 0.25-0.35 as a
+        # genuine low-confidence bucket for continuing occluded tracks.
+        self.body_tracker = build(BODY_SPAWN_THRESHOLD)   # carries identity
+        self.tracker = build()                 # faces belonging to no visible body
 
     def load_gallery(self, index_path: str, meta_path: str, live_only: bool = False):
         self.matcher = GalleryMatcher(index_path, meta_path, live_only=live_only)
@@ -393,15 +464,7 @@ class Pipeline:
         self._frame_idx += 1
         profile = self.config.profile
 
-        # Detect faces
         faces = self.embedder.detect(frame)
-        if not faces:
-            return FrameResult(
-                frame_idx=self._frame_idx,
-                timestamp=time.time(),
-                detections=[],
-                inference_ms=(time.time() - t0) * 1000,
-            )
 
         # Cap faces to avoid OOM. Keep the most confident ones: the old key was
         # the embedding's L2 norm, which is not a quality measure of anything.
@@ -409,28 +472,75 @@ class Pipeline:
             faces = sorted(faces, key=lambda f: float(f.det_score), reverse=True)
             faces = faces[:profile.max_faces_per_frame]
 
-        # Extract embeddings for all detected faces
-        bboxes = []
-        embeddings = []
-        scores = []
-        for face in faces:
-            # Float, not int: the Kalman filter works in continuous coordinates
-            # and rounding every box to whole pixels feeds it quantisation noise.
-            bboxes.append(face.bbox.astype(np.float32))
-            # insightface already L2-normalizes this for us
-            embeddings.append(face.normed_embedding.astype(np.float32))
-            scores.append(float(face.det_score))
+        persons = self.person_detector.detect(frame) if self.person_detector else []
 
-        # Track
-        tracks = self.tracker.update(bboxes, embeddings, scores)
-        active_ids = {t.id for t in tracks}
+        # Assign each face to the body containing it. A face inside a body box IS
+        # that body — counting both would make one person two attendees.
+        # ponytail: O(faces x bodies) in Python; ~3k comparisons at the measured
+        # worst case (98 faces, 33 bodies), well under a millisecond. Spatial
+        # binning only if a much wider camera changes those numbers.
+        owners = [face_to_person(f.bbox, persons) for f in faces]
+
+        # One body box often contains two faces in a crowd — the person it was
+        # drawn around, and someone standing behind their shoulder whose own body
+        # the detector missed. The larger face wins the body; the loser is NOT
+        # discarded, it falls through to the face tracker below. Dropping it
+        # deleted 17 of 35 people from this project's own crowd photo.
+        claimed: list = [None] * len(persons)      # (face index, face) per body
+        for i, (face, owner) in enumerate(zip(faces, owners)):
+            if owner is None:
+                continue
+            cur = claimed[owner]
+            if cur is None or _area(face.bbox) > _area(cur[1].bbox):
+                claimed[owner] = (i, face)
+
+        body_faces = [None if c is None else c[1] for c in claimed]
+
+        # Float, not int: the Kalman filter works in continuous coordinates and
+        # rounding every box to whole pixels feeds it quantisation noise.
+        # insightface already L2-normalizes the embeddings for us.
+        body_tracks = self.body_tracker.update(
+            [p.bbox.astype(np.float32) for p in persons],
+            [None if f is None else f.normed_embedding.astype(np.float32) for f in body_faces],
+            [p.score for p in persons],
+        )
+
+        # A face is only represented by its body if that body actually became a
+        # track. Not every detection does — ByteTrack spawns tracks solely from
+        # its high-confidence bucket, so a body below the split is reported by
+        # nothing. Checking rather than assuming means the person still gets
+        # counted, by the face path, however the detector is tuned.
+        tracked_bodies = {t.src_idx for t in body_tracks}
+        covered = {c[0] for j, c in enumerate(claimed)
+                   if c is not None and j in tracked_bodies}
+        orphans = [f for i, f in enumerate(faces) if i not in covered]
+        face_tracks = self.tracker.update(
+            [f.bbox.astype(np.float32) for f in orphans],
+            [f.normed_embedding.astype(np.float32) for f in orphans],
+            [float(f.det_score) for f in orphans],
+        )
+
+        # (track, its face this frame, id namespace). Body tracks first so a
+        # person with a visible face is reported as a body, not twice.
+        rows = [(t, body_faces[t.src_idx], 0) for t in body_tracks]
+        rows += [(t, orphans[t.src_idx], FACE_TRACK_ID_OFFSET) for t in face_tracks]
+        if not rows:
+            return FrameResult(
+                frame_idx=self._frame_idx,
+                timestamp=time.time(),
+                detections=[],
+                inference_ms=(time.time() - t0) * 1000,
+            )
+
+        active_ids = {t.id + off for t, _, off in rows}
 
         # Match against gallery + selective anti-spoof
         detections = []
-        for track in tracks:
+        for track, face, id_offset in rows:
             det = Detection(
-                track_id=track.id,
+                track_id=track.id + id_offset,
                 bbox=track.bbox.copy(),
+                face_bbox=None if face is None else face.bbox.astype(np.float32),
                 embedding=track.embedding,
             )
 
@@ -438,6 +548,9 @@ class Pipeline:
             # seen across many small frames is identified as well as one seen
             # close up. No face-size filter: small faces are the CCTV workload.
             det.observations = track.observations
+            # Bottom-centre of a body box is where the person is standing. This
+            # retires the chin anchor, which sat at head height and put people in
+            # the wrong zone depending on how they leaned.
             det.zone = zone_for(track.bbox, self.zones, frame.shape[1], frame.shape[0])
             if track.embedding is not None and self.matcher:
                 name, roll, score = self.matcher.match(track.embedding, self.config.match_threshold)
@@ -454,13 +567,14 @@ class Pipeline:
                 det.roll = track.roll
                 det.match_score = score
 
-            # Anti-spoof: only check every N-th analysis frame per track,
-            # and only for active tracks (not stale/drifted)
+            # Anti-spoof: only check every N-th analysis frame per track, and
+            # only on the face box — the heuristic is micro-motion in a face
+            # crop, and running it over a whole body measures walking.
             if (spoof_checker
-                    and track.embedding is not None
-                    and track.time_since_update <= 1
+                    and det.face_bbox is not None
                     and self._frame_idx % profile.spoof_check_every_n == 0):
-                is_spoof, liveness = spoof_checker.check(track.bbox, frame, track_id=track.id)
+                is_spoof, liveness = spoof_checker.check(det.face_bbox, frame,
+                                                         track_id=det.track_id)
                 det.is_spoof = is_spoof
                 det.liveness_score = liveness
 
@@ -475,5 +589,5 @@ class Pipeline:
             timestamp=time.time(),
             detections=detections,
             inference_ms=(time.time() - t0) * 1000,
-            num_faces=len(detections),
+            num_tracked=len(detections),
         )

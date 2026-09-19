@@ -99,7 +99,8 @@ class Unresolved(_Dwelling):
     label: str = ""         # person1, person2, ...
     track_id: int = 0
     crop_path: str = ""
-    crop_area: int = 0      # biggest face seen so far, so the teacher gets the best shot
+    crop_area: int = 0      # biggest crop seen so far, so the teacher gets the best shot
+    crop_is_face: bool = False   # False = we only ever saw their body
 
 
 @dataclass
@@ -161,7 +162,10 @@ class AttendanceLogger:
         Fold one analysed frame into the records. `frame` is optional and only
         used to save a face crop for the unresolved queue.
         """
-        active_bboxes = []
+        # (detection, face box) for everyone whose face is actually visible.
+        # Body boxes are useless for the overlap check — two people standing side
+        # by side overlap heavily and are not a photo spoof.
+        active_faces = []
 
         for det in detections:
             # Outside every configured zone = not in the room. Skipped before the
@@ -171,7 +175,9 @@ class AttendanceLogger:
             if self.zones_active and not det.zone:
                 continue
 
-            active_bboxes.append(det.bbox)
+            face_bbox = getattr(det, "face_bbox", None)
+            if face_bbox is not None:
+                active_faces.append((det, face_bbox))
 
             # A spoofed face must not accrue dwell for anybody, named or not.
             if det.is_spoof:
@@ -190,19 +196,22 @@ class AttendanceLogger:
                 self._touch_unresolved(det, timestamp, frame)
                 continue
 
-            rec = self._record_for(det.name, det.roll)
+            # A track that was person3 until its face finally matched: merge the
+            # dwell it accrued while unnamed instead of discarding it. This is
+            # the point of tracking bodies — someone who sat through the class
+            # facing away is credited from when they sat down, not from the
+            # moment they happened to glance at the camera. Merge BEFORE the
+            # touch so the still-open visit is the one that gets extended.
+            rec = (self.resolve(det.track_id, det.name, det.roll)
+                   or self._record_for(det.name, det.roll))
             self._touch(rec, det.zone, timestamp)
-
-            # Someone identified here cancels their own unresolved entry: the
-            # track was a stranger only until the face finally matched.
-            self.unresolved.pop(det.track_id, None)
 
         self._expire(timestamp)
 
         # Multiple overlapping faces: two bboxes with high IoU but different
         # track IDs = possible photo/screen spoof.
-        if len(active_bboxes) >= 2:
-            self._check_overlapping_faces(active_bboxes, detections, timestamp)
+        if len(active_faces) >= 2:
+            self._check_overlapping_faces(active_faces, timestamp)
 
     def _record_for(self, name: str, roll: str) -> PersonRecord:
         rec = self.records.get(roll)
@@ -241,12 +250,23 @@ class AttendanceLogger:
                             key=str(det.track_id), severity="warn")
 
     def _save_crop(self, entry: Unresolved, det, frame):
-        """Keep the largest face crop seen for this track — the teacher's evidence."""
+        """
+        Keep the largest face crop seen for this track — the teacher's evidence.
+
+        Falls back to the body box when the face is hidden, which is exactly the
+        case that put this person in the queue. Clothing and posture are what the
+        teacher has to go on then, so a torso beats no crop at all.
+        """
         if frame is None:
             return
-        x1, y1, x2, y2 = (int(v) for v in det.bbox)
+        face_bbox = getattr(det, "face_bbox", None)
+        is_face = face_bbox is not None
+        x1, y1, x2, y2 = (int(v) for v in (face_bbox if is_face else det.bbox))
         area = max(0, x2 - x1) * max(0, y2 - y1)
-        if area <= entry.crop_area:
+        # A face always beats a body crop; within the same kind, bigger wins.
+        # Comparing on area alone would let one torso — many times the area of
+        # any face — permanently block every later face from being saved.
+        if (is_face, area) <= (entry.crop_is_face, entry.crop_area):
             return
         import cv2
         h, w = frame.shape[:2]
@@ -260,6 +280,7 @@ class AttendanceLogger:
         if cv2.imwrite(str(path), crop):
             entry.crop_path = str(path)
             entry.crop_area = area
+            entry.crop_is_face = is_face
 
     def _expire(self, now: float):
         """Close visits whose gap has outlived the grace period, and flag hiding."""
@@ -309,11 +330,21 @@ class AttendanceLogger:
 
     # ---------------- alerts ----------------
 
-    def _check_overlapping_faces(self, bboxes, detections, timestamp):
-        """Flag when multiple face bboxes significantly overlap (potential spoof)."""
-        for i in range(len(bboxes)):
-            for j in range(i + 1, len(bboxes)):
-                b1, b2 = bboxes[i], bboxes[j]
+    def _check_overlapping_faces(self, active_faces, timestamp):
+        """
+        Flag when two face bboxes significantly overlap (potential photo spoof).
+
+        Takes (detection, face_bbox) pairs so the two stay aligned. They used to
+        be separate lists indexed in parallel, which they were not: the zone
+        filter skips detections without appending a box, so every alert after
+        the first skip named the wrong tracks.
+        """
+        for i in range(len(active_faces)):
+            for j in range(i + 1, len(active_faces)):
+                d1, b1 = active_faces[i]
+                d2, b2 = active_faces[j]
+                if d1.track_id == d2.track_id:
+                    continue
                 xa, ya = max(b1[0], b2[0]), max(b1[1], b2[1])
                 xb, yb = min(b1[2], b2[2]), min(b1[3], b2[3])
                 inter = max(0, xb - xa) * max(0, yb - ya)
@@ -322,18 +353,15 @@ class AttendanceLogger:
                 iou = inter / max(area1 + area2 - inter, 1e-6)
 
                 if iou > 0.5:
-                    d1 = detections[i] if i < len(detections) else None
-                    d2 = detections[j] if j < len(detections) else None
-                    if d1 and d2 and d1.track_id != d2.track_id:
-                        names = f"track {d1.track_id} and track {d2.track_id}"
-                        # Keyed on the track pair so two people standing in line
-                        # raise one alert, not one per frame for as long as they
-                        # stand there. Ordered so (3,7) and (7,3) are one subject.
-                        pair = tuple(sorted((d1.track_id, d2.track_id)))
-                        self._log_alert("multiple_overlapping", d1.track_id,
-                                        f"Overlapping faces (IoU={iou:.2f}): {names} — possible photo spoof",
-                                        key=f"{pair[0]}-{pair[1]}", severity="info")
-                        return  # one alert per frame is enough
+                    names = f"track {d1.track_id} and track {d2.track_id}"
+                    # Keyed on the track pair so two people standing in line
+                    # raise one alert, not one per frame for as long as they
+                    # stand there. Ordered so (3,7) and (7,3) are one subject.
+                    pair = tuple(sorted((d1.track_id, d2.track_id)))
+                    self._log_alert("multiple_overlapping", d1.track_id,
+                                    f"Overlapping faces (IoU={iou:.2f}): {names} — possible photo spoof",
+                                    key=f"{pair[0]}-{pair[1]}", severity="info")
+                    return  # one alert per frame is enough
 
     def _log_alert(self, alert_type: str, track_id: int, details: str,
                    key: str = "", severity: str = "warn"):
