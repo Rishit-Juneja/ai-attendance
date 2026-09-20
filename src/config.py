@@ -116,8 +116,13 @@ class Config:
     # it was set when consecutive samples were 50ms apart and they are now 333ms,
     # so both a real face and a hand-held photo move considerably more between
     # them. Erring high costs detections of real spoofs; erring low flags live
-    # people. No substitute for holding a photo up to the camera and reading the
-    # liveness scores off the live overlay.
+    # people. No substitute for holding a photo up to the camera and measuring:
+    #   python tools/calibrate_spoof.py --label live  --seconds 40
+    #   python tools/calibrate_spoof.py --label spoof --seconds 40   (printed photo)
+    #   python tools/calibrate_spoof.py --report
+    # That prints the recommended value, and tells you if the two distributions
+    # overlap — in which case no threshold works and this heuristic needs
+    # replacing with a real liveness model, not retuning.
     spoof_pixel_movement_thresh: float = 1.5
     spoof_frame_count: int = 15         # frames to check for motion
     unknown_face_alert: bool = True
