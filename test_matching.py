@@ -872,6 +872,28 @@ def test_unchecked_liveness_is_reported_separately_from_clean_liveness():
     assert s["liveness_unjudged"] == 0, "still listed unjudged after a real check"
 
 
+def test_a_detection_nobody_checked_defaults_to_unjudged():
+    """
+    The test above builds its own detection and sets liveness_score by hand,
+    which is exactly how the real default stayed wrong: pipeline.Detection
+    defaulted to 1.0, and the spoof check only runs when face_bbox is not None.
+    So every head-down person — the case the body tracker exists for — was filed
+    as a clean liveness check that never ran.
+    """
+    from src.pipeline import Detection
+    from src.attendance import AttendanceLogger
+
+    d = Detection(track_id=1, bbox=np.array([0.0, 0.0, 50.0, 120.0]))
+    assert d.face_bbox is None, "no face means the checker is never called"
+    assert d.liveness_score < 0, "unchecked detection claims a clean liveness score"
+
+    log = AttendanceLogger(session_name="_test_liveness_default")
+    log.process_detections([d], 0, 1000.0)
+    s = log.get_summary()
+    assert s["liveness_checked"] == 0, "a face nobody looked at counted as checked"
+    assert s["liveness_unjudged"] == 1
+
+
 def test_a_face_too_small_to_judge_is_never_flagged():
     """
     The model resizes its 2.7x crop to 80x80, so a face under ~30px wide is pure
@@ -949,7 +971,10 @@ def test_missing_liveness_model_falls_back_instead_of_flagging():
     assert ck.model.predict([0, 0, 40, 40], np.zeros((480, 640, 3), np.uint8)) == -1.0
     is_spoof, liveness = ck.check(np.array([100, 100, 140, 140]),
                                   np.zeros((480, 640, 3), np.uint8), track_id=1)
-    assert is_spoof is False and liveness == 1.0
+    # Not flagged — but not blessed either. One frame in, the heuristic's window
+    # is nowhere near full, so the honest answer is 'no verdict yet'.
+    assert is_spoof is False
+    assert liveness < 0, "warm-up frames reported as a clean liveness check"
 
 
 if __name__ == "__main__":

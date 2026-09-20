@@ -56,7 +56,12 @@ class Detection:
     roll: str = ""
     match_score: float = 0.0
     is_spoof: bool = False
-    liveness_score: float = 1.0
+    # -1.0 = nobody judged this face, NOT "judged and alive". The spoof check
+    # only runs when face_bbox is not None, so the head-down person this whole
+    # system exists to keep tracking never reaches it — defaulting to 1.0 filed
+    # every one of them under liveness_checked and made the report claim a
+    # check that never ran. See AttendanceLogger.get_summary.
+    liveness_score: float = -1.0
     observations: int = 0     # frames averaged into this track's embedding; higher = more confident
     zone: str = ""            # named zone containing this person, "" if none defined
 

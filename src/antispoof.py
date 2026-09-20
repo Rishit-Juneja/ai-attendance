@@ -2,13 +2,17 @@
 Anti-spoofing / liveness detection.
 
 Strategy:
-1. Primary: motion heuristic — compute pixel intensity variance within the face bbox
-   across N consecutive frames. Real faces have micro-movements (breathing, blinking,
-   slight head motion). Printed photos/screens have near-zero variance.
-2. Optional: Silent-Face-Anti-Spoofing model (if installed). Falls back to heuristic.
+1. Primary: MiniFASNetV2 texture model, when the weights are present. Texture is
+   the axis that actually separates paper and screens from skin.
+2. Fallback: motion heuristic — mean absolute pixel difference within the face
+   bbox across consecutive frames. Catches print and NOTHING ELSE; a photo on an
+   LCD produced motion in 69% of samples here, because the monitor's refresh
+   beats against the camera shutter and the banding reads as life.
 
-The spoof check runs on a rolling window per track, not per frame — only when the
-track's face has been stable (low motion) for enough frames do we flag it.
+Either way the verdict is smoothed over a rolling window per track, and either
+way a check that could not run returns -1.0 rather than a clean score. "Judged
+alive" and "never judged" are different facts and a report that collapses them
+is claiming a safety property this system does not have.
 """
 import collections
 from dataclasses import dataclass
@@ -78,7 +82,7 @@ class SpoofChecker:
     def __init__(
         self,
         buffer_size: int = 15,
-        movement_threshold: float = 1.5,
+        movement_threshold: float = 1.0,   # measured; see config.spoof_pixel_movement_thresh
         flag_after_n: int = 10,
         face_padding: float = 0.2,
         model_path: str = None,
@@ -115,7 +119,7 @@ class SpoofChecker:
         y2 = min(h, y2 + pad_y)
 
         if x2 - x1 < 10 or y2 - y1 < 10:
-            return False, 1.0
+            return False, -1.0      # too small to diff; abstain, don't approve
 
         # Extract and resize face crop
         face_crop = frame[y1:y2, x1:x2]
@@ -140,9 +144,11 @@ class SpoofChecker:
 
         state.frame_buffer.append(face_resized)
 
-        # Need enough frames to decide
+        # Need enough frames to decide. Abstain until then — reporting 1.0 here
+        # credited a clean liveness check to every track in its first 10 frames,
+        # which for a face that appears briefly is every frame it ever gets.
         if len(state.motion_scores) < self.flag_after_n:
-            return False, 1.0
+            return False, -1.0
 
         # Compute average motion over the window
         recent_scores = list(state.motion_scores)[-self.flag_after_n:]
@@ -213,11 +219,10 @@ class SilentFaceLiveness:
 
     Returns -1.0 with no model file, which is the caller's signal to fall back.
 
-    The three things the earlier version of this class got wrong, all of which
-    produce confident nonsense rather than an error:
-      * ImageNet mean/std normalization. The model wants a plain /255.
-      * A sigmoid over one logit. The head is a 3-class softmax.
-      * Reading index 1 as "real". Index 1 is PRINT ATTACK; live is index 0.
+    Preprocessing and the output head are MEASURED against this export, not read
+    off the model card — the card is wrong on both and both failures are silent.
+    See the note above LIVE_CLASS before changing anything here, and re-run
+    tools/probe_spoof_preproc.py if you swap the weights.
     """
 
     def __init__(self, model_path: str = None):
