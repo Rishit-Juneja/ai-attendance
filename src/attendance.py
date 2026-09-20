@@ -145,6 +145,9 @@ class AttendanceLogger:
         self._person_seq = 0
         self.alerts: list[Alert] = []
         self.frame_log: list[dict] = []
+        # Liveness coverage, by roll (or track id for the unnamed).
+        self._liveness_checked: set[str] = set()
+        self._liveness_unjudged: set[str] = set()
 
         # One row per (alert_type, subject) per session. Without this, an
         # unrecognised face standing in shot raised an alert on every analysed
@@ -180,6 +183,16 @@ class AttendanceLogger:
             face_bbox = getattr(det, "face_bbox", None)
             if face_bbox is not None:
                 active_faces.append((det, face_bbox))
+
+            # Whether this person was ever actually liveness-checked. A negative
+            # score means the check abstained — face too small to judge, or no
+            # model loaded. Tracked because "0 spoofs found" and "0 people
+            # checked" look identical in a report, and only one of them is
+            # reassuring. At classroom distances the second is the normal case.
+            if getattr(det, "liveness_score", -1.0) >= 0:
+                self._liveness_checked.add(det.roll or f"t{det.track_id}")
+            else:
+                self._liveness_unjudged.add(det.roll or f"t{det.track_id}")
 
             # A spoofed face must not accrue dwell for anybody, named or not.
             if det.is_spoof:
@@ -415,6 +428,10 @@ class AttendanceLogger:
             "brief": len(self.records) - len(confirmed),
             "unresolved_count": len(self.unresolved),
             "spoof_detected": sum(1 for r in self.records.values() if r.spoof_flags > 0),
+            # Read these two together or not at all: "0 spoofs" is only good news
+            # if liveness_checked is non-zero.
+            "liveness_checked": len(self._liveness_checked),
+            "liveness_unjudged": len(self._liveness_unjudged - self._liveness_checked),
             "alerts": len(self.alerts),
             "persons": [
                 {

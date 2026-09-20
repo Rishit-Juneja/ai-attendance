@@ -467,10 +467,15 @@ class _Det:
     """Minimal stand-in for pipeline.Detection."""
 
     def __init__(self, name="Unknown", roll="", track_id=1, score=0.9,
-                 is_spoof=False, observations=30, zone="", face_visible=True):
+                 is_spoof=False, observations=30, zone="", face_visible=True,
+                 liveness_score=None):
         self.name, self.roll, self.track_id = name, roll, track_id
         self.match_score, self.is_spoof = score, is_spoof
-        self.liveness_score, self.observations = 0.1 if is_spoof else 0.9, observations
+        # Negative means the check abstained. Defaults to a real verdict so the
+        # older tests keep exercising the judged path.
+        self.liveness_score = (0.1 if is_spoof else 0.9) if liveness_score is None \
+            else liveness_score
+        self.observations = observations
         self.zone = zone
         self.bbox = np.array([0, 0, 40, 120], dtype=np.float32)       # body
         # None models someone turned around or covered up: the body is tracked,
@@ -841,6 +846,32 @@ def test_every_label_a_churning_track_collects_is_recorded():
         f"only {rec.duration_sec:.1f}s — dwell was lost across the respawn")
 
 
+def test_unchecked_liveness_is_reported_separately_from_clean_liveness():
+    """
+    'No spoofs detected' and 'nobody was checked' render identically in a report
+    and mean opposite things. At classroom distances faces are 20-30px, well
+    under the model's floor, so the second is the NORMAL case — a report that
+    cannot express it is claiming a safety property the system does not have.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_liveness_coverage")
+    # Face too small to judge: the checker abstains with a negative score.
+    log.process_detections(
+        [_Det(track_id=1, name="Krish", roll="K1", liveness_score=-1.0)], 0, 1000.0)
+    s = log.get_summary()
+    assert s["spoof_detected"] == 0
+    assert s["liveness_checked"] == 0, "abstention counted as a clean check"
+    assert s["liveness_unjudged"] == 1
+
+    # Same person, now close enough to actually judge.
+    log.process_detections(
+        [_Det(track_id=1, name="Krish", roll="K1", liveness_score=0.9)], 0, 1001.0)
+    s = log.get_summary()
+    assert s["liveness_checked"] == 1
+    assert s["liveness_unjudged"] == 0, "still listed unjudged after a real check"
+
+
 def test_a_face_too_small_to_judge_is_never_flagged():
     """
     The model resizes its 2.7x crop to 80x80, so a face under ~30px wide is pure
@@ -857,7 +888,8 @@ def test_a_face_too_small_to_judge_is_never_flagged():
     ck.model.model = object()
     frame = np.zeros((480, 640, 3), np.uint8)
     tiny = np.array([100, 100, 100 + LIVENESS_MIN_FACE_PX - 1, 140], dtype=np.float32)
-    assert ck.check(tiny, frame, track_id=1) == (False, 1.0)
+    # -1.0, not 1.0: abstaining must not be recorded as a clean bill of health.
+    assert ck.check(tiny, frame, track_id=1) == (False, -1.0)
 
 
 def test_liveness_head_is_read_as_a_three_class_softmax():

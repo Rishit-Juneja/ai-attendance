@@ -18,6 +18,44 @@ import cv2
 import numpy as np
 
 
+CROP_SCALE = 2.7   # the "2.7" in 2.7_80x80_MiniFASNetV2 — see SilentFaceLiveness._crop
+INPUT_SIZE = 80
+
+# MEASURED, because the model card is wrong on both counts. It documents a /255
+# input and a [live, print, replay] head with live at index 0. Probed with
+# tools/probe_spoof_preproc.py against this export:
+#
+#   /255 : random noise, pure black, pure white and real faces ALL return
+#          p=[0.000 0.007 0.992]. The model is returning a constant — the
+#          normalization is already in the graph, so dividing again flattens
+#          the input to a range the first conv cannot separate.
+#   raw  : real faces  p=[0.010 0.250 0.740]
+#          random noise p=[0.003 0.983 0.014]
+#
+# So the input is raw 0-255 and real faces land on class 2, not class 0. Reading
+# index 0 would have marked every living person a spoof with total confidence.
+LIVE_CLASS = 2
+
+# Below this face width the model is not given enough to judge and its answer is
+# not used. Texture is the entire basis for the verdict, blur reads like the
+# flatness of print, and a false spoof flag COSTS A REAL STUDENT THEIR
+# ATTENDANCE — so abstaining is the safe failure.
+#
+# 65, not the 30 first guessed from the 80x80 input size. Measured against a real
+# person on the CCTV feed, sorted by face width:
+#     47px 0.011   48px 0.035   55px 0.290   61px 0.010   62px 0.024
+#     66px 0.885   72px 0.883   74px 0.970   76px 0.913   77px 0.986
+# A living person falls off a cliff below ~65px. PROVISIONAL: one 20s capture,
+# and the subject was looking down for most of it, so face width is confounded
+# with pose — leaning in makes the face both bigger and more frontal. Re-measure
+# with tools/verify_spoof_model.py --rtsp before relying on the exact value.
+#
+# Consequence worth stating plainly: a real classroom puts faces at 20-30px, so
+# this check will almost never run there. That is not a tuning problem. A model
+# cannot read skin texture that the sensor did not capture.
+LIVENESS_MIN_FACE_PX = 65
+
+
 @dataclass
 class SpoofState:
     """Per-track spoof detection state."""
@@ -44,11 +82,13 @@ class SpoofChecker:
         flag_after_n: int = 10,
         face_padding: float = 0.2,
         model_path: str = None,
+        min_face_px: int = LIVENESS_MIN_FACE_PX,
     ):
         self.buffer_size = buffer_size
         self.movement_threshold = movement_threshold
         self.flag_after_n = flag_after_n
         self.face_padding = face_padding
+        self.min_face_px = min_face_px
         self._states: dict[int, SpoofState] = {}
         # When the model is present it replaces the heuristic rather than voting
         # with it. Measured on this camera, the heuristic scores a photo on a
@@ -128,11 +168,14 @@ class SpoofChecker:
         single frame is not evidence. One blurred or half-turned face scoring
         fake would otherwise block a real student's attendance outright.
         """
-        if float(bbox[2]) - float(bbox[0]) < LIVENESS_MIN_FACE_PX:
-            return False, 1.0        # too small to judge — see LIVENESS_MIN_FACE_PX
+        # -1.0, not 1.0. "Too small to judge" and "judged, looks alive" are
+        # different facts, and collapsing them is how a system ends up reporting
+        # zero spoofs for a room it never checked.
+        if float(bbox[2]) - float(bbox[0]) < self.min_face_px:
+            return False, -1.0
         score = self.model.predict(bbox, frame)
         if score < 0:
-            return False, 1.0
+            return False, -1.0
 
         state = self._states.get(track_id)
         if state is None:
@@ -158,34 +201,6 @@ class SpoofChecker:
         dead = [tid for tid in self._states if tid not in active_track_ids]
         for tid in dead:
             del self._states[tid]
-
-
-CROP_SCALE = 2.7   # the "2.7" in 2.7_80x80_MiniFASNetV2 — see _crop below
-INPUT_SIZE = 80
-
-# MEASURED, because the model card is wrong on both counts. It documents a /255
-# input and a [live, print, replay] head with live at index 0. Probed with
-# tools/probe_spoof_preproc.py against this export:
-#
-#   /255 : random noise, pure black, pure white and real faces ALL return
-#          p=[0.000 0.007 0.992]. The model is returning a constant — the
-#          normalization is already in the graph, so dividing again flattens
-#          the input to a range the first conv cannot separate.
-#   raw  : real faces  p=[0.010 0.250 0.740]
-#          random noise p=[0.003 0.983 0.014]
-#
-# So the input is raw 0-255 and real faces land on class 2, not class 0. Reading
-# index 0 would have marked every living person a spoof with total confidence.
-LIVE_CLASS = 2
-
-# Below this face width the model is not given enough to judge and its answer is
-# not used. The 2.7x crop is resized to 80x80, so a face narrower than ~30px is
-# pure upscaling — no skin texture survives, and texture is the entire basis for
-# the verdict. Blur reads like the flatness of print, so small faces skew toward
-# "spoof", and a false spoof flag COSTS A REAL STUDENT THEIR ATTENDANCE. Refusing
-# to answer is the safe failure here; the back rows are simply not liveness-
-# checkable at this resolution, which is the same ~30px floor identification has.
-LIVENESS_MIN_FACE_PX = 30
 
 
 class SilentFaceLiveness:
