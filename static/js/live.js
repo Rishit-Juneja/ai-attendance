@@ -429,7 +429,13 @@
         // the finished result and worth pulling once more.
         await camStop();
         await refreshUnresolved();
-        camStatus.textContent = 'Analysis complete — review the queue below.';
+        // The live feed polls ~8fps of wall time while a file runs at several
+        // times real speed, so roughly 1 frame in 13 is ever seen. Point at the
+        // annotated file instead — it has every frame, and tracking is judged by
+        // scrubbing and pausing, not by watching a slideshow go past.
+        camStatus.textContent = d.annotated
+          ? 'Analysis complete — review the queue below. Annotated video: ' + d.annotated
+          : 'Analysis complete — review the queue below.';
         return;
       }
       if (!d.running) { camStatus.textContent = 'Stream ended.'; await camStop(); return; }

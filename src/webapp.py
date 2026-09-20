@@ -577,7 +577,7 @@ _stream = {"cap": None, "thread": None, "run": False, "frame": None, "err": None
            # whether it ran to the end. "done" is what tells the UI the analysis
            # finished rather than the camera dying — opposite meanings, and the
            # old worker reported both as an error.
-           "done": False, "pos_sec": 0.0, "total_frames": 0}
+           "done": False, "pos_sec": 0.0, "total_frames": 0, "annotated": ""}
 _stream_lock = threading.Lock()
 
 # Extensions OpenCV will open as a file. Anything else is treated as a live
@@ -691,6 +691,21 @@ def _stream_worker(url: str):
     # in the file says when it was filmed, and the camera's own clock reads
     # 2000-01-01. Treat recording timestamps as offsets from when it was run.
     t_zero = time.time()
+    # Annotated output, recordings only. The browser feed polls single JPEGs at
+    # ~8fps of WALL time while a file is analysed at several times real speed —
+    # measured 2.8x on 1080p with 35 faces, so a viewer sees about 1 frame in 13
+    # and cannot tell a held track from a re-spawned one. Every annotated frame
+    # goes to a file instead, which is also what §13 wants: something you can
+    # pause and count heads on by hand.
+    writer = None
+    if is_file and _config.log_video_detections and _logger is not None:
+        writer = cv2.VideoWriter(
+            str(_logger.log_dir / "annotated.mp4"),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            cap.get(cv2.CAP_PROP_FPS) or 30.0,
+            (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))),
+        )
+        _stream["annotated"] = str(_logger.log_dir / "annotated.mp4")
     pipeline = get_pipeline()
     misses = 0
     last_dets = []
@@ -741,13 +756,21 @@ def _stream_worker(url: str):
             x1, y1, x2, y2 = (d.bbox if glided is None else glided).astype(int)
             known = d.name != "Unknown"
             color = (0, 0, 255) if d.is_spoof else ((0, 200, 0) if known else (140, 140, 140))
-            label = f"{d.name} {d.match_score:.2f}" if known else f"#{d.track_id} {d.match_score:.2f}"
+            # Track id on matched people too, not just strangers: a name silently
+            # hopping to a different track is the failure you are looking for when
+            # reviewing a recording, and a label showing only the name hides it.
+            label = f"{d.name} #{d.track_id} {d.match_score:.2f}" if known \
+                else f"#{d.track_id} {d.match_score:.2f}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, max(12, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        if writer is not None:
+            writer.write(frame)
         with _stream_lock:
             _stream["frame"] = frame
     cap.release()
+    if writer is not None:
+        writer.release()
     _stream["cap"] = None
     _stream["run"] = False
     if _stream["done"]:
@@ -833,7 +856,7 @@ def api_live_stream_start():
         flag_after_n=_config.spoof_frame_count,
     )
     _stream.update(run=True, err=None, frame=None, url=url,
-                   done=False, pos_sec=0.0, total_frames=0)
+                   done=False, pos_sec=0.0, total_frames=0, annotated="")
     _stream["thread"] = threading.Thread(target=_stream_worker, args=(url,), daemon=True)
     _stream["thread"].start()
     return jsonify({"ok": True, "url": url, "session": _logger.session_name})
@@ -874,6 +897,7 @@ def api_live_stream_status():
         "done": _stream["done"],
         "recording": _is_recording(_stream["url"]),
         "pos_sec": round(_stream["pos_sec"], 1),
+        "annotated": _stream["annotated"],
         "summary": (_logger or _review).get_summary() if (_logger or _review) else None,
     })
 

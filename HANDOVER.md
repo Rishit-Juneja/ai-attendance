@@ -556,7 +556,8 @@ a camera on nearly every axis:
 | Clock | wall clock | the video's own `CAP_PROP_POS_MSEC` |
 | Buffering | `BUFFERSIZE=1`, 5s timeouts | none — dropping a frame would skip footage |
 | End of input | error after 30 misses | success; closes the session itself |
-| Speed | camera rate | as fast as the GPU manages (measured ~6× real time) |
+| Speed | camera rate | as fast as the GPU manages (2.8× on 1080p/35 faces) |
+| Overlay | browser feed | `annotated.mp4`, every frame, for scrubbing |
 
 **The clock is the whole feature.** Both `should_analyze()` and
 `process_frame()` took the wall clock unconditionally, and both are wrong for a
@@ -579,6 +580,23 @@ A file running out closes the session through `_finish_session()` — the same
 path as the Stop button, because the footage ending *is* the end of class and
 has to settle the books identically. It matters that this is automatic: the
 analysis finishes faster than real time and usually unattended.
+
+**You cannot judge tracking from the browser feed, and the annotated video is
+why.** The feed polls single JPEGs at ~8fps of *wall* time while a recording is
+analysed at 2–3× real speed — measured **2.8×** on 1080p/30fps with 35 faces,
+so a viewer sees about **1 frame in 13**. That is enough to confirm boxes exist
+and nothing like enough to tell a held track from one that died and respawned.
+
+So every annotated frame is written to `data/logs/<session>/annotated.mp4`
+instead, which you scrub, pause and step through — and which is what §13's
+"count heads by hand" actually needs. Labels carry the **track id on matched
+people too**, not just strangers: a name hopping to a different track is the
+failure you are looking for, and a name-only label hides it.
+
+Cost, measured on 1080p/30fps: throughput drops **2.8× → 1.8×** real time and
+the file grows at **~0.84 MB per second of footage** — a 40-minute class is
+about 2 GB. `log_video_detections = False` turns it off for long unattended
+runs.
 
 Session output lands in `data/logs/<session>/`: `attendance.json`,
 `attendance.csv`, unresolved crops, plus the daily CSV/PDF in `data/reports/`.

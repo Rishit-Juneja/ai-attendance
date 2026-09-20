@@ -150,7 +150,14 @@ class Config:
     #     https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx
     spoof_model_path: str = str(DATA_DIR / "models" / "minifasnet_v2.onnx")
     unknown_face_alert: bool = True
-    log_video_detections: bool = True   # draw boxes on saved video
+    # Write data/logs/<session>/annotated.mp4 when analysing a recording. On by
+    # default because judging tracking is the main reason to feed a recording in
+    # at all, and the browser feed cannot do it — it polls ~8fps of wall time
+    # while a file runs at 2-3x real speed, so ~1 frame in 13 is ever seen.
+    # Measured cost on 1080p/30fps: throughput 2.8x -> 1.8x real time, and
+    # ~0.84 MB per second of footage (a 40-minute class is ~2 GB). Turn off for
+    # long runs nobody is going to watch.
+    log_video_detections: bool = True
 
     @property
     def profile(self) -> GPUProfile:
