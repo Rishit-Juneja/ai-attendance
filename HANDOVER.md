@@ -95,7 +95,8 @@ Files, by responsibility:
 | `tools/probe_spoof_preproc.py` | Sweeps model preprocessing; proves it responds at all |
 | `tools/verify_spoof_model.py` | Scores real images or live frames through the model |
 | `tools/export_person_model.py` | Produces `yolo11n.onnx` (needs torch; one-off) |
-| `test_matching.py` | 32 tests covering every non-trivial rule below |
+| `tools/measure_det_size.py` | Usable faces vs detect time per `det_size`. Run on real footage |
+| `test_matching.py` | 33 tests covering every non-trivial rule below |
 
 ---
 
@@ -563,7 +564,7 @@ a comment at the setting itself.
 | `spoof_pixel_movement_thresh` | 1.0 | Measured: live floor 1.40, print 0.00–0.06. §9 |
 | `spoof_model_path` | `data/models/minifasnet_v2.onnx` | Absent = heuristic fallback. §9 |
 | `LIVENESS_MIN_FACE_PX` | 65 | In `antispoof.py`. Below this the checker abstains (`-1.0`). §9 |
-| `det_size` | 640×640 | SCRFD input. **A hidden downscale — see §16.** |
+| `det_size` | 640×640 | SCRFD input. Raising it is measured **not** to pay — §16 |
 | `emb_batch` | 32 | Batched recognition |
 | `BODY_SPAWN_THRESHOLD` | 0.35 | In `pipeline.py`; YOLO-calibrated |
 
@@ -574,7 +575,7 @@ Profile switch: `GPU_PROFILE=demo python -m src.webapp`.
 ## 13. Tests
 
 ```fish
-python test_matching.py     # 32 tests, all green
+python test_matching.py     # 33 tests, all green
 python -m src.zones         # zones self-check
 ```
 
@@ -604,8 +605,10 @@ ownership logic, re-run it against `data/test_faces/` and count.
 - **The motion fallback does not catch screens.** Print only. If the weights
   aren't downloaded, a phone held up defeats the check by construction (§9).
 - Sub-stream (640x480) caps recognition range. Use `/stream1`.
-- **`det_size=640` silently halves your effective resolution** on a 1080p feed.
-  A 34px face reaches the detector as 11px and is never found (§16).
+- `det_size=640` is **not** the hidden range limit an earlier version of this
+  document claimed. Measured: 1280 buys 2 usable faces for +43% detect time,
+  and most of what it adds is sub-25px guesswork (§16). Unverified on real
+  1920 classroom footage — re-run `tools/measure_det_size.py` there.
 - ONNX Runtime binds to CUDA on this machine (verified: both `[ArcFace]` and
   `[YOLO person]` log `running on GPU (CUDAExecutionProvider)` with
   `onnxruntime-gpu` 1.30 + `nvidia-cudnn-cu13` 9.24). Keep trusting those boot
@@ -794,15 +797,43 @@ are three regimes in the target room:
 - **< 30px** — neither. Self-cancelling for spoofing (a spoofer isn't
   identified either) but everyone in this band lands in the unresolved queue.
 
-### `det_size` is a second, hidden downscale — check this first
+### `det_size`: the obvious fix that measurement does not support
 
-SCRFD runs at **640×640**. A 1920-wide frame is scaled **3× before detection**,
-so a 34px face arrives at the detector as **11px** and is simply not found. It
-never even reaches the unresolved queue.
+This section used to say SCRFD's 640×640 input scales a 1920-wide frame 3×, so
+a 34px face arrives as 11px and is "simply not found", and that raising
+`det_size` to (1280,1280) was the first thing to try. **That was reasoning, not
+measuring, and it is wrong.** Measured on this project's own photos with
+`tools/measure_det_size.py`:
 
-`det_size=(1280,1280)` quarters that penalty. **This is easy to mistake for a
-sensor limit when it is a config one** — check it before concluding the camera
-isn't good enough.
+| det_size | usable faces (≥25px) | detect time |
+|---|---|---|
+| 640 | 65 | baseline |
+| 1280 | 67 (+2) | +43% |
+| 1920 | 68 (+3) | +94% |
+
+Two things the raw detection count hides:
+
+- **Most of what 1280 adds is unusable.** On the 98-face crowd photo it finds
+  149 boxes instead of 98 — and 130 of them are under 25px, where this
+  project's own measurements put genuine and impostor scores on top of each
+  other. Those aren't recoveries, they're guesses that cost embedding time and
+  put phantoms in front of a teacher.
+- **The faces that matter were never missing.** The 1600px photo's 37–47px
+  faces are all found at 640. SCRFD's feature pyramid goes down to stride 8, so
+  a face downscaled to ~15px is still within reach — the plain
+  frame_width ÷ det_size arithmetic overstates the loss badly.
+
+Meanwhile the cost lands where there is no headroom: 3 fps allows **333 ms** per
+analysis frame, detection at 1280 on the crowd photo already takes 247 ms on
+the RTX 5060, and the deployment target is a GTX 1650 at roughly 3–4× slower —
+before any embedding.
+
+So `det_size` stays at 640. **The caveat that keeps this open:** these are
+1280–1600px photos, not 1920 classroom footage at the real seating geometry.
+Re-run the tool on the first real frames — it prints usable faces against
+detect time, which is the trade the arithmetic above missed. If the target room
+turns out to sit right on the stride-8 edge the answer could flip, but flip it
+on a measurement this time.
 
 ### Enrollment: photos were denied, and that turned out to be better
 
@@ -831,8 +862,11 @@ The gallery will hold real biometric templates of real students. It lives in
 
 ### Checklist for the first real-footage session
 
-1. **`det_size` → (1280,1280)** before drawing any conclusion about range.
-2. **Two cameras** if at all possible. Nothing else doubles pixels-per-face.
+1. **Two cameras** if at all possible. Nothing else doubles pixels-per-face,
+   and it is the only lever that moves identification and liveness together.
+2. `python tools/measure_det_size.py --rtsp <url>` on real frames. Do not raise
+   `det_size` because the arithmetic says to — on the photos here it cost 43%
+   of the detect budget for two faces. Let the tool answer it for the room.
 3. **Enroll from the footage**, not from photos. Merge tracks into
    `Student_01..60`.
 4. **Re-measure the spoof threshold** at whatever `analysis_fps` ends up — it
