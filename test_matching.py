@@ -738,7 +738,7 @@ def test_unresolved_person_is_queued_and_resolves_retroactively():
     assert not log.get_summary()["unresolved"], "resolved person stayed in the queue"
     assert rec.duration_sec >= 44, f"back-dated dwell lost: {rec.duration_sec}"
     assert rec.status == "present", rec.status
-    assert rec.resolved_from == "person1"
+    assert rec.resolved_from == ["person1"]
 
     assert log.resolve(4, "Rishit", "11825210004") is None, "resolved twice"
 
@@ -805,9 +805,40 @@ def test_covered_dwell_is_back_filled_when_the_face_finally_matches():
         f"only {rec.duration_sec:.1f}s credited — the covered portion was "
         "discarded instead of back-filled")
     assert rec.status == "present", rec.status
-    assert rec.resolved_from == "person1", rec.resolved_from
+    assert rec.resolved_from == ["person1"], rec.resolved_from
     assert len(rec.visits) == 1, (
         f"{len(rec.visits)} visits — the merge split one continuous stay in two")
+
+
+def test_every_label_a_churning_track_collects_is_recorded():
+    """
+    One person, two track IDs — which is what the first real-camera run actually
+    produced: a seated man's body track died behind his chair and respawned, so
+    he was person1 and later person2 before matching.
+
+    resolved_from used to be assigned, not appended, so the earlier label was
+    silently dropped and the report showed a single clean merge. That hid track
+    churn in exactly the records where it had happened, which is how it went
+    unnoticed until the dwell numbers were audited by hand.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_churn")
+
+    # First track: unnamed, accrues time, then the track is lost.
+    t = _walk_past(log, _Det(track_id=7, observations=9, face_visible=False),
+                   1000.0, seconds=20.0)
+    # Respawns with a fresh ID, still unnamed, then finally matches.
+    t = _walk_past(log, _Det(track_id=8, observations=9, face_visible=False),
+                   t, seconds=20.0)
+    log.process_detections([_Det(track_id=8, name="Krish", roll="K1")], 0, t)
+    # The first label is resolved by hand, the way a teacher would.
+    log.resolve(7, "Krish", "K1")
+
+    rec = log.records["K1"]
+    assert rec.resolved_from == ["person2", "person1"], rec.resolved_from
+    assert rec.duration_sec >= 39, (
+        f"only {rec.duration_sec:.1f}s — dwell was lost across the respawn")
 
 
 if __name__ == "__main__":

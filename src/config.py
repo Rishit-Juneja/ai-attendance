@@ -96,10 +96,20 @@ class Config:
     # to cover a body being fully occluded — a hidden FACE no longer costs the
     # name, which is what forced this up from 2s originally.
     # CAUTION: identity is sticky per track, so a long buffer also means a track
-    # whose ID gets handed to someone else keeps the old name. Raise toward
-    # 30-60s for a seated classroom, where association is near-trivial (IoU ~1.0
-    # on a stationary person) and the buffer is therefore cheap.
-    track_lost_sec: float = 8.0
+    # whose ID gets handed to someone else keeps the old name.
+    #
+    # Raised 8 -> 45 on 2026-09-20 after the first real-camera run: two people in
+    # two minutes produced THREE unresolved labels, because a seated man's body
+    # track died behind his chair and respawned with a new ID. Each respawn
+    # re-matches the gallery from scratch; that one got lucky and landed on the
+    # same name, but a miss would have split him into two half-length records.
+    # 45s is cheap here because a lost track is never emitted — update() returns
+    # only tracks matched to a detection this frame — so a longer buffer buys ID
+    # continuity without crediting dwell to anyone who is not visible.
+    # Safe for a seated room, where association is near-trivial (IoU ~1.0 on a
+    # stationary person). Lower it toward 10-15s for a doorway or corridor view,
+    # where people genuinely leave and a stale box can be claimed by a stranger.
+    track_lost_sec: float = 45.0
     # Attendance is dwell-based: you are present once you have accumulated this
     # much time inside a zone, across however many visits. Walking past the door
     # no longer marks you present, which the old "seen in 3 frames" rule did.

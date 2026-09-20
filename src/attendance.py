@@ -80,7 +80,9 @@ class PersonRecord(_Dwelling):
     name: str = ""
     roll: str = ""
     spoof_flags: int = 0
-    resolved_from: str = "" # set when a teacher named this person from the queue
+    # Every queue label that merged into this person, in merge order. A list, not
+    # a string: track churn gives one person several labels over a session.
+    resolved_from: list = field(default_factory=list)
     anomaly_flags: list = field(default_factory=list)
     min_dwell_sec: float = 30.0
 
@@ -325,7 +327,12 @@ class AttendanceLogger:
         rec.visits.sort(key=lambda v: v.entered)
         rec.detection_count += entry.detection_count
         rec.zone = rec.zone or entry.zone
-        rec.resolved_from = entry.label
+        # Append rather than assign. One person routinely collects several labels
+        # when their track dies and respawns, and overwriting kept only the last
+        # — which hid the churn precisely in the records where it happened. On
+        # the first real-camera run one man absorbed person2 and then person3,
+        # and the report showed only person3.
+        rec.resolved_from.append(entry.label)
         return rec
 
     # ---------------- alerts ----------------
@@ -423,7 +430,7 @@ class AttendanceLogger:
                     "detections": r.detection_count,
                     "spoofs": r.spoof_flags,
                     "zone": r.zone,
-                    "resolved_from": r.resolved_from,
+                    "resolved_from": ", ".join(r.resolved_from),
                 }
                 for r in self.records.values()
             ],
