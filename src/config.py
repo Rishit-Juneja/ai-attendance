@@ -144,6 +144,11 @@ class Config:
     # interval it was measured at.
     spoof_pixel_movement_thresh: float = 1.0
     spoof_frame_count: int = 15         # frames to check for motion
+    # MiniFASNetV2 (Apache 2.0). Present = it replaces the motion heuristic
+    # entirely; absent = heuristic, and screens go undetected. Fetch with:
+    #   curl -L -o data/models/minifasnet_v2.onnx \
+    #     https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx
+    spoof_model_path: str = str(DATA_DIR / "models" / "minifasnet_v2.onnx")
     unknown_face_alert: bool = True
     log_video_detections: bool = True   # draw boxes on saved video
 

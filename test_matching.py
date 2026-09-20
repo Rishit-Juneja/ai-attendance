@@ -841,6 +841,55 @@ def test_every_label_a_churning_track_collects_is_recorded():
         f"only {rec.duration_sec:.1f}s — dwell was lost across the respawn")
 
 
+def test_liveness_head_is_read_as_a_three_class_softmax():
+    """
+    MiniFASNetV2's head is softmax over [live, print, replay]. The stub this
+    replaced applied a sigmoid to index 1 and called it "real" — index 1 is the
+    PRINT ATTACK logit. That combination runs without error and returns a
+    confident number that means nothing, which is the worst way to be wrong.
+    """
+    from src.antispoof import SilentFaceLiveness as S
+
+    assert S._liveness([10.0, 0.0, 0.0]) > 0.999      # live
+    assert S._liveness([0.0, 10.0, 0.0]) < 0.001      # print attack
+    assert S._liveness([0.0, 0.0, 10.0]) < 0.001      # replay attack
+    assert abs(S._liveness([1.0, 1.0, 1.0]) - 1 / 3) < 1e-9
+    # Shifted exponent, so a saturated head does not overflow to nan.
+    assert abs(S._liveness([900.0, 900.0, 900.0]) - 1 / 3) < 1e-9
+
+
+def test_liveness_crop_is_2_7x_and_stays_square_at_the_frame_edge():
+    """
+    The model was trained on boxes expanded 2.7x, and the tell for a print or
+    replay attack is often outside the face — paper edge, phone bezel, flat
+    background. Clamping matters: letting the box run off the frame and relying
+    on numpy's silent truncation changes the effective scale, so a face near the
+    edge would be fed to the model at the wrong zoom.
+    """
+    from src.antispoof import SilentFaceLiveness as S
+
+    frame = np.zeros((480, 640, 3), np.uint8)
+    middle = S._crop([300, 200, 340, 240], frame)     # 40px box -> 40*2.7 = 108
+    assert middle.shape[:2] == (108, 108), middle.shape
+    corner = S._crop([0, 0, 40, 40], frame)
+    assert corner.shape[:2] == (108, 108), corner.shape
+
+
+def test_missing_liveness_model_falls_back_instead_of_flagging():
+    """
+    No model file must mean 'use the heuristic', never 'everyone is a spoof'.
+    A liveness check that fails closed would block the whole class.
+    """
+    from src.antispoof import SpoofChecker
+
+    ck = SpoofChecker(model_path="data/models/definitely_not_here.onnx")
+    assert ck.model.model is None
+    assert ck.model.predict([0, 0, 40, 40], np.zeros((480, 640, 3), np.uint8)) == -1.0
+    is_spoof, liveness = ck.check(np.array([100, 100, 140, 140]),
+                                  np.zeros((480, 640, 3), np.uint8), track_id=1)
+    assert is_spoof is False and liveness == 1.0
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

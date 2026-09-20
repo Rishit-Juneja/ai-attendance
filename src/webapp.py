@@ -96,7 +96,10 @@ def get_spoof_checker() -> SpoofChecker:
         _spoof_checker = SpoofChecker(
             movement_threshold=_config.spoof_pixel_movement_thresh,
             flag_after_n=_config.spoof_frame_count,
+            model_path=_config.spoof_model_path,
         )
+        print(f"[spoof] {'MiniFASNetV2 model' if _spoof_checker.model.model
+                         else 'motion heuristic (no model — screens will pass)'}")
     return _spoof_checker
 
 
