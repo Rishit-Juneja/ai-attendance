@@ -841,18 +841,48 @@ def test_every_label_a_churning_track_collects_is_recorded():
         f"only {rec.duration_sec:.1f}s — dwell was lost across the respawn")
 
 
+def test_a_face_too_small_to_judge_is_never_flagged():
+    """
+    The model resizes its 2.7x crop to 80x80, so a face under ~30px wide is pure
+    upscaling and no skin texture survives. Blur reads like the flatness of
+    print, so small faces skew toward 'spoof' — and a false spoof flag costs a
+    real student their attendance. Back rows must be un-judged, not condemned.
+    """
+    from src.antispoof import SpoofChecker, LIVENESS_MIN_FACE_PX
+
+    ck = SpoofChecker(model_path=None)
+    # Force the model branch without needing weights: any object whose .model is
+    # not None routes through _check_model, and the size guard returns before
+    # anything is asked of it.
+    ck.model.model = object()
+    frame = np.zeros((480, 640, 3), np.uint8)
+    tiny = np.array([100, 100, 100 + LIVENESS_MIN_FACE_PX - 1, 140], dtype=np.float32)
+    assert ck.check(tiny, frame, track_id=1) == (False, 1.0)
+
+
 def test_liveness_head_is_read_as_a_three_class_softmax():
     """
-    MiniFASNetV2's head is softmax over [live, print, replay]. The stub this
-    replaced applied a sigmoid to index 1 and called it "real" — index 1 is the
-    PRINT ATTACK logit. That combination runs without error and returns a
-    confident number that means nothing, which is the worst way to be wrong.
-    """
-    from src.antispoof import SilentFaceLiveness as S
+    MiniFASNetV2's head is a 3-class softmax and the stub this replaced applied a
+    sigmoid to a single logit — which runs without error and returns a confident
+    number that means nothing, the worst way to be wrong.
 
-    assert S._liveness([10.0, 0.0, 0.0]) > 0.999      # live
-    assert S._liveness([0.0, 10.0, 0.0]) < 0.001      # print attack
-    assert S._liveness([0.0, 0.0, 10.0]) < 0.001      # replay attack
+    LIVE_CLASS is 2, measured (tools/probe_spoof_preproc.py), against a model
+    card that claims 0. Pinning it here means a future edit that "corrects" it
+    back to the documented value fails loudly instead of silently marking every
+    living person a spoof.
+    """
+    from src.antispoof import SilentFaceLiveness as S, LIVE_CLASS
+
+    assert LIVE_CLASS == 2, "measured on this export; see probe_spoof_preproc.py"
+    live = [0.0, 0.0, 0.0]
+    live[LIVE_CLASS] = 10.0
+    assert S._liveness(live) > 0.999
+    for fake in range(3):
+        if fake == LIVE_CLASS:
+            continue
+        logits = [0.0, 0.0, 0.0]
+        logits[fake] = 10.0
+        assert S._liveness(logits) < 0.001, f"class {fake} read as live"
     assert abs(S._liveness([1.0, 1.0, 1.0]) - 1 / 3) < 1e-9
     # Shifted exponent, so a saturated head does not overflow to nan.
     assert abs(S._liveness([900.0, 900.0, 900.0]) - 1 / 3) < 1e-9

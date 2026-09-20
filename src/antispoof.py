@@ -128,6 +128,8 @@ class SpoofChecker:
         single frame is not evidence. One blurred or half-turned face scoring
         fake would otherwise block a real student's attendance outright.
         """
+        if float(bbox[2]) - float(bbox[0]) < LIVENESS_MIN_FACE_PX:
+            return False, 1.0        # too small to judge — see LIVENESS_MIN_FACE_PX
         score = self.model.predict(bbox, frame)
         if score < 0:
             return False, 1.0
@@ -160,6 +162,30 @@ class SpoofChecker:
 
 CROP_SCALE = 2.7   # the "2.7" in 2.7_80x80_MiniFASNetV2 — see _crop below
 INPUT_SIZE = 80
+
+# MEASURED, because the model card is wrong on both counts. It documents a /255
+# input and a [live, print, replay] head with live at index 0. Probed with
+# tools/probe_spoof_preproc.py against this export:
+#
+#   /255 : random noise, pure black, pure white and real faces ALL return
+#          p=[0.000 0.007 0.992]. The model is returning a constant — the
+#          normalization is already in the graph, so dividing again flattens
+#          the input to a range the first conv cannot separate.
+#   raw  : real faces  p=[0.010 0.250 0.740]
+#          random noise p=[0.003 0.983 0.014]
+#
+# So the input is raw 0-255 and real faces land on class 2, not class 0. Reading
+# index 0 would have marked every living person a spoof with total confidence.
+LIVE_CLASS = 2
+
+# Below this face width the model is not given enough to judge and its answer is
+# not used. The 2.7x crop is resized to 80x80, so a face narrower than ~30px is
+# pure upscaling — no skin texture survives, and texture is the entire basis for
+# the verdict. Blur reads like the flatness of print, so small faces skew toward
+# "spoof", and a false spoof flag COSTS A REAL STUDENT THEIR ATTENDANCE. Refusing
+# to answer is the safe failure here; the back rows are simply not liveness-
+# checkable at this resolution, which is the same ~30px floor identification has.
+LIVENESS_MIN_FACE_PX = 30
 
 
 class SilentFaceLiveness:
@@ -211,10 +237,10 @@ class SilentFaceLiveness:
 
     @staticmethod
     def _liveness(logits: np.ndarray) -> float:
-        """Softmax over [live, print, replay]; live is index 0."""
+        """Softmax over the 3-class head; see LIVE_CLASS for why index 2."""
         z = np.asarray(logits, dtype=np.float64).ravel()
         e = np.exp(z - z.max())      # shift for numerical stability
-        return float((e / e.sum())[0])
+        return float((e / e.sum())[LIVE_CLASS])
 
     def predict(self, bbox, frame: np.ndarray) -> float:
         """Probability the face is a real one (0=spoof, 1=live), -1.0 if no model."""
@@ -223,6 +249,8 @@ class SilentFaceLiveness:
         patch = self._crop(bbox, frame)
         if patch.size == 0:
             return -1.0
+        # Raw 0-255, BGR, NCHW. NOT /255 — see the note on LIVE_CLASS above; the
+        # normalization is baked into the graph and dividing again flattens it.
         patch = cv2.resize(patch, (INPUT_SIZE, INPUT_SIZE))   # BGR, as captured
-        patch = (patch.astype(np.float32) / 255.0).transpose(2, 0, 1)[np.newaxis]
+        patch = patch.astype(np.float32).transpose(2, 0, 1)[np.newaxis]
         return self._liveness(self.model.run(None, {self._input: patch})[0])
