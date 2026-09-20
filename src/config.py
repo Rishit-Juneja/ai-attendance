@@ -112,18 +112,27 @@ class Config:
     exit_grace_sec: float = 60.0
     # No face for this long inside an open visit = possibly covering it.
     hiding_alert_after_sec: float = 15.0
-    # Motion heuristic threshold. NEEDS RE-TUNING against a real printed photo:
-    # it was set when consecutive samples were 50ms apart and they are now 333ms,
-    # so both a real face and a hand-held photo move considerably more between
-    # them. Erring high costs detections of real spoofs; erring low flags live
-    # people. No substitute for holding a photo up to the camera and measuring:
-    #   python tools/calibrate_spoof.py --label live  --seconds 40
-    #   python tools/calibrate_spoof.py --label spoof --seconds 40   (printed photo)
-    #   python tools/calibrate_spoof.py --report
-    # That prints the recommended value, and tells you if the two distributions
-    # overlap — in which case no threshold works and this heuristic needs
-    # replacing with a real liveness model, not retuning.
-    spoof_pixel_movement_thresh: float = 1.5
+    # Motion heuristic threshold, MEASURED 2026-09-20 on the 1080p CCTV feed at
+    # 3 fps (333ms between samples) via tools/calibrate_spoof.py. 95 live samples:
+    # min 1.40, p5 5.75, median 13.85 — a live face never once dropped below 1.4.
+    # A static image sat at 0.00-0.06. So 1.0 clears the live floor with margin
+    # while still catching a motionless photo.
+    #
+    # Deliberately set BELOW the live minimum rather than midway between the two
+    # distributions: a false spoof flag blocks a real student's attendance, which
+    # is a worse failure than missing a spoof. flag_after_n adds a second margin
+    # by requiring 15 consecutive samples (5s) under this before flagging.
+    #
+    # KNOWN HOLE: this catches print, not screens. In the same measurement a photo
+    # displayed on an LCD produced motion in 69% of samples (median 9.72) because
+    # the monitor's refresh beats against the camera shutter — banding shifts
+    # between frames and reads as life. No threshold fixes that; the flicker is
+    # genuinely larger than the signal. A phone held up by a judge defeats this.
+    # SilentFaceLiveness in antispoof.py is the answer there, not a number here.
+    #
+    # Re-measure if analysis_fps changes — the value is only valid for the
+    # interval it was measured at.
+    spoof_pixel_movement_thresh: float = 1.0
     spoof_frame_count: int = 15         # frames to check for motion
     unknown_face_alert: bool = True
     log_video_detections: bool = True   # draw boxes on saved video

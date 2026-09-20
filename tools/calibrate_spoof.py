@@ -43,6 +43,16 @@ OUT_DIR = LOGS_DIR / "spoof_calibration"
 DEFAULT_URL = "rtsp://CAMERA-IP:554/stream1"
 
 
+def _iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    areas = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (areas - inter)
+
+
 def collect(url: str, label: str, seconds: float, padding: float = 0.2) -> Path:
     """Sample face-crop motion at the configured analysis rate."""
     interval = 1.0 / DEFAULT_CONFIG.profile.analysis_fps
@@ -64,6 +74,8 @@ def collect(url: str, label: str, seconds: float, padding: float = 0.2) -> Path:
 
     motions: list[float] = []
     prev_crop = None
+    prev_bbox = None
+    switches = 0
     started = time.time()
     last = 0.0
     while time.time() - started < seconds:
@@ -81,7 +93,8 @@ def collect(url: str, label: str, seconds: float, padding: float = 0.2) -> Path:
             # quietly average a real person together with the photo they hold.
             continue
 
-        x1, y1, x2, y2 = faces[0].bbox.astype(int)
+        bbox = faces[0].bbox.astype(int)
+        x1, y1, x2, y2 = bbox
         h, w = frame.shape[:2]
         px, py = int((x2 - x1) * padding), int((y2 - y1) * padding)
         crop = frame[max(0, y1 - py):min(h, y2 + py), max(0, x1 - px):min(w, x2 + px)]
@@ -90,16 +103,38 @@ def collect(url: str, label: str, seconds: float, padding: float = 0.2) -> Path:
         # Same maths as SpoofChecker.check, deliberately: calibrating anything
         # else would produce a number that does not transfer.
         crop = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (64, 64))
+
+        # One face per frame is not enough to guarantee it is the SAME face. With
+        # a real person and a photo both in shot, the detector finds one or the
+        # other from frame to frame and this loop happily diffs a face against a
+        # photograph — which reads as enormous "motion" and silently poisons the
+        # distribution. Measured on this camera: alternating samples of 0.04 and
+        # 21.94, which is not a thing a human body does in 333 ms. Require the
+        # box to overlap the previous one, so a subject switch drops the sample
+        # instead of becoming one.
+        if prev_bbox is not None and _iou(bbox, prev_bbox) < 0.3:
+            switches += 1
+            prev_crop, prev_bbox = crop, bbox
+            continue
+
         if prev_crop is not None:
             motions.append(float(np.mean(cv2.absdiff(crop, prev_crop))))
             print(f"\r  samples={len(motions):4d}  last={motions[-1]:6.2f}  "
-                  f"mean={np.mean(motions):6.2f}", end="", flush=True)
-        prev_crop = crop
+                  f"mean={np.mean(motions):6.2f}  switches={switches:3d}",
+                  end="", flush=True)
+        prev_crop, prev_bbox = crop, bbox
 
     cap.release()
     print()
     if len(motions) < 10:
         raise SystemExit(f"Only {len(motions)} samples — was a single face in shot?")
+    if switches > len(motions) * 0.2:
+        raise SystemExit(
+            f"Rejected: {switches} subject switches against {len(motions)} usable "
+            f"samples.\nThe detector kept finding a DIFFERENT face between samples, "
+            f"so more than one\nface was in shot — a photo on a screen behind you "
+            f"counts. Clear the frame\nof every face except the one you are "
+            f"measuring and run this again.")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUT_DIR / f"{label}.json"
@@ -108,6 +143,7 @@ def collect(url: str, label: str, seconds: float, padding: float = 0.2) -> Path:
         "url": url,
         "analysis_fps": DEFAULT_CONFIG.profile.analysis_fps,
         "interval_ms": round(interval * 1000),
+        "switches": switches,
         "motions": motions,
     }, indent=2))
     print(f"[{label}] {len(motions)} samples → {path}")
