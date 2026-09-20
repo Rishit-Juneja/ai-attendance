@@ -4,6 +4,9 @@ Face-recognition classroom attendance off a live CCTV stream. This document is
 the whole system: what exists, how each piece works, and why the non-obvious
 decisions were made that way.
 
+**New to the project? Read §15 (what it's trying to do) and §16 (the room it
+has to work in) first.** §1–§14 are the machine; §15–§16 are the point.
+
 ---
 
 ## 1. Run it
@@ -78,7 +81,7 @@ Files, by responsibility:
 | `src/config.py` | All tunables + the two GPU profiles (`dev`, `demo`) |
 | `src/pipeline.py` | Detect → track → embed → match. The core. |
 | `src/persons.py` | YOLO11n body detection on ONNX Runtime |
-| `src/antispoof.py` | Motion-based liveness heuristic |
+| `src/antispoof.py` | MiniFASNetV2 liveness (texture), motion heuristic fallback |
 | `src/zones.py` | Named polygon zones, normalized coordinates |
 | `src/attendance.py` | Dwell accounting, unresolved queue, alerts |
 | `src/enroll.py` | Add/remove people, rebuild the FAISS index |
@@ -88,7 +91,11 @@ Files, by responsibility:
 | `src/dashboard.py` | Standalone websocket dashboard (pre-Flask, still works) |
 | `src/main.py`, `src/run_demo.py` | CLI entry points for video files |
 | `src/evaluate.py` | Accuracy measurement against a labelled set |
-| `test_matching.py` | 27 asserts covering every non-trivial rule below |
+| `tools/calibrate_spoof.py` | Measures the motion threshold on this camera |
+| `tools/probe_spoof_preproc.py` | Sweeps model preprocessing; proves it responds at all |
+| `tools/verify_spoof_model.py` | Scores real images or live frames through the model |
+| `tools/export_person_model.py` | Produces `yolo11n.onnx` (needs torch; one-off) |
+| `test_matching.py` | 32 tests covering every non-trivial rule below |
 
 ---
 
@@ -331,41 +338,137 @@ tracks.
 
 ---
 
-## 9. Anti-spoof ⚠️ NEEDS TUNING
+## 9. Anti-spoof — two modes, and a hard pixel floor
 
-`src/antispoof.py`. Motion heuristic: crop the face (20% padding), take the
-mean absolute pixel difference between consecutive crops, and flag a track
-whose motion stays below `spoof_pixel_movement_thresh` for `flag_after_n`
-frames. Real faces micro-move (breathing, blinking); printed photos and screens
-don't.
+`src/antispoof.py`. Everything here was measured on the real 1080p feed at
+3 fps on 2026-09-20, not read off a datasheet. Which mode is active is printed
+at boot.
 
-Runs only on the **face box** — the heuristic is micro-motion in a face crop,
-and running it over a whole body measures walking.
+### Mode A — MiniFASNetV2 (primary, if the weights are present)
 
-> **Outstanding, and it needs you and a printed photo — but it is no longer
-> guesswork.** `spoof_pixel_movement_thresh = 1.5` was calibrated when
-> consecutive samples were 50 ms apart. They are now **333 ms** apart (3 fps),
-> so both a real face and a hand-held photo move considerably more between
-> samples. Micro-motion doesn't scale linearly with the gap, so the number
-> can't be rescaled on paper. Measure it:
->
-> ```fish
-> python tools/calibrate_spoof.py --label live  --seconds 40   # just sit there
-> python tools/calibrate_spoof.py --label spoof --seconds 40   # hold up a photo
-> python tools/calibrate_spoof.py --report
-> ```
->
-> It samples through the real detector at the configured analysis rate using the
-> same crop-and-diff maths as `SpoofChecker`, then compares the **live 5th
-> percentile against the spoof 95th percentile** — the tails, because a
-> threshold set from the means flags every live person who briefly holds still.
-> If those two overlap it says so: that means no threshold separates them on
-> this camera and the heuristic needs replacing with a real liveness model
-> (`SilentFaceLiveness`), not retuning.
+Judges liveness from **texture**, which is the axis that actually separates
+paper and screens from skin. 1.74 MB, Apache-2.0, not committed (`data/` is
+gitignored):
+
+```fish
+curl -L -o data/models/minifasnet_v2.onnx \
+  https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx
+```
+
+**The model card is wrong twice, and both failures are silent.** It documents a
+`/255` input and a `[live, print, replay]` head with live at index 0.
+
+- Under `/255`, random noise, pure black, pure white and real faces all return
+  `p=[0.000 0.007 0.992]` — a **constant**. The normalization is already baked
+  into the graph, so dividing again flattens the input past what the first conv
+  can separate.
+- Fed raw 0–255 it responds: real faces `[0.010 0.250 0.740]`, noise
+  `[0.003 0.983 0.014]`. Real faces land on **class 2**, not class 0.
+
+Reading index 0 as documented marks every living person a spoof with total
+confidence and nothing raises. `tools/probe_spoof_preproc.py` is what found
+this; run it before trusting any exported model.
+
+The **2.7× crop** the model name refers to is not padding. The tell for a print
+or replay attack is often *outside* the face — paper edge, phone bezel, flat
+background moving with the head — so a tight crop throws away the evidence.
+Clamped to the frame, because truncating at the edge silently changes the zoom
+the model sees. This is also why `tools/verify_spoof_model.py` scores live
+frames rather than saved crops: saved crops are already tight, so the 2.7×
+expansion has nothing to expand into.
+
+Verdicts are smoothed over the per-track window on a **median** — one blurred
+frame should not cost a real student their attendance.
+
+### Mode B — motion heuristic (fallback, no weights)
+
+Crop the face (20% padding), take the mean absolute pixel difference between
+consecutive crops, flag a track whose motion stays below
+`spoof_pixel_movement_thresh` for `flag_after_n` frames. Runs on the **face
+box** only — over a whole body it measures walking.
+
+`spoof_pixel_movement_thresh = 1.0`, measured: 95 live samples floored at
+**1.40** (p5 5.75, median 13.85), a static printed image sat at **0.00–0.06**.
+Set below the live floor rather than midway between the distributions, because
+a false flag costs a real student their attendance while a missed spoof costs
+one detection.
+
+> **It catches print and nothing else.** A photo displayed on an LCD produced
+> motion in **69% of samples** — the monitor's refresh beats against the camera
+> shutter and the banding reads as life. Replayed through the flagging logic,
+> the longest run of sub-threshold samples was 4 against the 15 needed. A phone
+> held up by a judge walks straight through, by construction. No threshold
+> fixes this; the flicker is larger than the signal.
+
+Re-measure if `analysis_fps` changes — the number is only valid at the sampling
+interval it was taken at, and micro-motion does not scale linearly with the gap:
+
+```fish
+python tools/calibrate_spoof.py --label live  --seconds 40   # just sit there
+python tools/calibrate_spoof.py --label spoof --seconds 40   # hold up a photo
+python tools/calibrate_spoof.py --report
+```
+
+Keep **exactly one face in shot**. With a person and a photo both visible the
+detector finds one or the other between frames, and diffing a face against a
+photograph poisons the result — the first run alternated 0.04 and 21.94 between
+333 ms samples, which no human body does, and the tool confidently reported
+OVERLAP off it. It now requires box overlap with the previous sample and
+refuses to write a file when subject switches exceed 20% of usable samples.
+
+### The pixel floor — the part that decides whether any of this matters
+
+Liveness needs **~65px of face width**, not the 30px the 80×80 input implies.
+Measured against a real person on the CCTV feed:
+
+| 47px | 48px | 55px | 61px | 62px | **66px** | 72px | 74px | 76px | 77px |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.011 | 0.035 | 0.290 | 0.010 | 0.024 | **0.885** | 0.883 | 0.970 | 0.913 | 0.986 |
+
+A living person falls off a cliff below ~65px. Provisional — one 20s capture,
+and the subject was looking down for much of it, so width is confounded with
+pose. Below the floor the checker **abstains**.
+
+The target room gives 34–64px faces (§16). **This check will almost never run
+there**, and no model fixes that — it cannot read skin texture the sensor never
+captured. It is largely self-cancelling: below ~30px nobody is identified
+*including a spoofer*, so they land in the unresolved queue like anyone else.
+The genuinely exposed band is roughly **30–65px — identifiable but not
+judgeable.**
+
+### Abstention is not approval
+
+The checker returns **`-1.0`** when it cannot judge, and the summary carries
+`liveness_checked` beside `liveness_unjudged`. "0 spoofs detected" and "0
+people checked" render identically in a report and mean opposite things; only
+one is reassuring, and at classroom distance the other is the normal case. A
+report that cannot express that difference is claiming a safety property the
+system does not have.
+
+**`Detection.liveness_score` defaults to `-1.0`, and that default is the whole
+mechanism.** The spoof check only runs when `face_bbox is not None`, so the
+head-down person the body tracker exists for never reaches it at all. While the
+default was `1.0` every one of them arrived at the logger carrying a clean
+score nobody produced, and `liveness_checked` counted them — the accounting
+layer was honest and the producer was not. The heuristic's warm-up frames and
+its too-small-to-diff crop had the same hole. Anything that returns a liveness
+score must return a negative one when no check ran.
+
+Note what hid this: `test_matching.py` builds its own detection stub and sets
+`liveness_score` by hand, so 32 tests exercised the field and none of them ever
+saw its default. One test even asserted the wrong value outright. When a
+dataclass default encodes a safety claim, test the real class.
+
+A missing model file falls back to the heuristic and never flags. Failing
+closed would block the whole class.
 
 `spoof_check_every_n` is 1 (every analysed frame). It skipped 4 in 5 when
 analysis ran at 20 fps, which was the point; at 3 fps the same setting would
 take 25 seconds to flag a held-up photo.
+
+**Still unmeasured:** what a spoof actually scores *through the model*. A real
+person got a median of 0.665, which is uninterpretable until a printed photo is
+run down the same path.
 
 ---
 
@@ -453,12 +556,14 @@ a comment at the setting itself.
 | `analysis_fps` | 3 (dev) / 2 (demo) | §10 |
 | `match_threshold` | 0.32 | Impostor ceiling 0.26, genuine floor 0.33 |
 | `track_embed_window` | 30 | 0.28→0.46 on a 25px face |
-| `track_lost_sec` | 8.0 | Covers a body fully occluded. Raise to 30–60 for a seated classroom — association is near-trivial there (IoU ~1.0) so the buffer is cheap. Caveat: identity is sticky, so a long buffer also means a misassigned ID keeps the wrong name longer. |
+| `track_lost_sec` | 45.0 | Raised from 8 after a real run: a seated man's body track died behind his chair and respawned with a new ID, producing 3 queue labels for 2 people. Each respawn re-matches the gallery from scratch. Cheap because `update()` only returns tracks matched *this* frame, so a longer buffer buys ID continuity without crediting dwell to anyone invisible. **Lower it again for a doorway view**, where a stale box can be claimed by a stranger. |
 | `min_dwell_sec` | 30.0 | Presence threshold |
 | `exit_grace_sec` | 60.0 | Head-down tolerance |
 | `hiding_alert_after_sec` | 15.0 | Face-covered heads-up |
-| `spoof_pixel_movement_thresh` | 1.5 | **Stale — see §9** |
-| `det_size` | 640×640 | SCRFD input |
+| `spoof_pixel_movement_thresh` | 1.0 | Measured: live floor 1.40, print 0.00–0.06. §9 |
+| `spoof_model_path` | `data/models/minifasnet_v2.onnx` | Absent = heuristic fallback. §9 |
+| `LIVENESS_MIN_FACE_PX` | 65 | In `antispoof.py`. Below this the checker abstains (`-1.0`). §9 |
+| `det_size` | 640×640 | SCRFD input. **A hidden downscale — see §16.** |
 | `emb_batch` | 32 | Batched recognition |
 | `BODY_SPAWN_THRESHOLD` | 0.35 | In `pipeline.py`; YOLO-calibrated |
 
@@ -469,14 +574,15 @@ Profile switch: `GPU_PROFILE=demo python -m src.webapp`.
 ## 13. Tests
 
 ```fish
-python test_matching.py     # 27 asserts, all green
+python test_matching.py     # 32 tests, all green
 python -m src.zones         # zones self-check
 ```
 
 Coverage: dwell accumulation across visits, grace-period merging, back-dated
-resolution, label non-reuse, crop ranking, alert dedup, track-ID namespacing,
-face→body ownership with the shoulder-surfer case, and zone containment at two
-resolutions.
+resolution, label non-reuse and churn (`resolved_from` is a list), crop
+ranking, alert dedup, track-ID namespacing, face→body ownership with the
+shoulder-surfer case, zone containment at two resolutions, liveness
+preprocessing, and abstention being reported separately from a clean pass.
 
 **A warning worth keeping.** Two silent people-loss bugs in the hybrid
 body/face path — faces dropped when their body wasn't tracked, and the
@@ -492,8 +598,14 @@ ownership logic, re-run it against `data/test_faces/` and count.
 - **~1.2 m/s** movement ceiling at 3 fps. Faster than that breaks association.
 - Person detection under-counts dense rooms (8/98 on the crowd photo). The face
   tracker is the fallback, and it's why both exist.
-- Anti-spoof threshold is stale (§9).
+- **Liveness abstains at classroom distance.** It needs ~65px of face; the
+  target room gives 34–64px. Exposed band is 30–65px: identifiable but not
+  judgeable (§9).
+- **The motion fallback does not catch screens.** Print only. If the weights
+  aren't downloaded, a phone held up defeats the check by construction (§9).
 - Sub-stream (640x480) caps recognition range. Use `/stream1`.
+- **`det_size=640` silently halves your effective resolution** on a 1080p feed.
+  A 34px face reaches the detector as 11px and is never found (§16).
 - ONNX Runtime binds to CUDA on this machine (verified: both `[ArcFace]` and
   `[YOLO person]` log `running on GPU (CUDAExecutionProvider)` with
   `onnxruntime-gpu` 1.30 + `nvidia-cudnn-cu13` 9.24). Keep trusting those boot
@@ -502,3 +614,231 @@ ownership logic, re-run it against `data/test_faces/` and count.
   runs; it just leaves the 5060 idle.
 - The Flask dev server is the dev server. Put a real WSGI server in front of it
   before this sits in a school.
+- Ultralytics YOLO is **AGPL-3.0**. Fine for a competition; it is network
+  copyleft if this is ever served publicly. Apache-2.0 swaps: YOLOX, RTMDet.
+
+---
+
+## 15. What the system is actually for
+
+Five targets. They are not independent — every one of them bottoms out in
+pixels-per-face, which is why §16 exists.
+
+### T1 — Real-time tracking on a remote GPU
+
+**Goal:** follow every person in the room continuously, with an overlay that
+looks live, while inference runs on a GPU **10–15 km away** with latency nobody
+can predict in advance. Deployment hardware is a **GTX 1650 (4GB)**, up to ~100
+people in a room.
+
+**Where it stands: done, and the architecture is the answer.** The
+display/analysis split is mandatory, not an optimisation — at 640x480 a
+full-rate feed is ~5 Mbps per camera and there is no budget to ship it. Display
+runs locally at camera rate; analysis runs at 3 fps; `BoxGlide` carries boxes
+forward at measured velocity in between so the overlay stays smooth (§10).
+
+The cost measurements that made 100 people feasible, on the RTX 5060 (a 1650 is
+~3–4× slower):
+
+| faces | detect | detect+embed (serial) | batched |
+|---|---|---|---|
+| 12 | 7.3 ms | 118.6 ms | 27.0 ms |
+| 35 | 9.5 ms | 327.2 ms | 86.4 ms |
+| 98 | 10.2 ms | 926.5 ms | 192.0 ms |
+
+**Detection is flat with crowd size. Per-face embedding was the entire
+problem** — batching gave 4.7× with bit-identical embeddings. YOLO person
+detection adds ~10 ms and is also flat. The detector is never the bottleneck.
+
+100 people stays feasible only because of **track-then-identify**: embed a
+person once, then track them. Not re-embed 100 faces every frame.
+
+**Left to do:** when the real RTT is known, extrapolate `BoxGlide` by it so
+boxes compensate for network delay instead of just for the analysis gap.
+
+### T2 — Foolproofing: presence must mean presence
+
+**Goal:** a name on the register should mean that person was in the room, for a
+real length of time, and not because the system guessed.
+
+**Where it stands: done, and this is what dwell accounting is** (§5). Being
+seen is not being present — 30s of accumulated dwell inside a zone is. Walking
+past the open door doesn't mark you present; the old "seen in 3 frames" rule
+did exactly that. `brief` is a real status, distinct from absent, because
+"seen but not long enough" and "never here" are different claims.
+
+The supporting rules all exist for the same reason: identity is sticky per
+track so labels don't strobe; a spoofed detection accrues dwell for nobody; the
+60s grace means a head-down student keeps accruing instead of having their
+dwell shredded into uncreditable slivers.
+
+**The honest part:** the system reports what it could not judge rather than
+implying a clean result. `liveness_unjudged` beside `liveness_checked` (§9) is
+the clearest example — a report that renders "0 spoofs" and "0 checked"
+identically is claiming a safety property the system does not have.
+
+### T3 — Evasion detection
+
+**Goal:** notice people actively working around the system, and notice the
+system failing, rather than silently logging a clean-looking register.
+
+**Where it stands: partly done. This is the weakest target.** What exists:
+
+| Signal | Catches | Status |
+|---|---|---|
+| `face_hiding` | Face gone 15s+ while still counted present | Works |
+| `unknown_face` | Someone the gallery doesn't know | Works, deduped |
+| `multiple_overlapping` | Two face boxes at IoU > 0.5 — a held-up photo | Works, face boxes only |
+| `spoof` | Print (heuristic) or texture (model) | **Abstains under 65px** |
+| Unresolved queue | Anyone never matched, with an evidence crop | Works |
+
+**Proxy attendance is the attack that matters and is not directly addressed.**
+Someone sitting in for an absent student is, to this system, simply an
+unrecognised person in the unresolved queue — which is the correct behaviour,
+but it makes the teacher the detector, not the system.
+
+The **body-carries-identity** design is itself an evasion countermeasure and
+the most effective one here: covering your face no longer removes you. You stay
+tracked, you stay in the queue with a torso crop, and your dwell is still
+counted — it just needs a name attached afterwards. Under a face-only pipeline
+you would simply cease to exist.
+
+**Not built, deliberately:** directional entry/exit. Attendance asks "who is in
+the room" (containment). "Who crossed this line, in which direction" needs
+per-track crossing history and is a separate feature on top of zones (§6), not
+a reinterpretation of them.
+
+### T4 — Body structure carries the identity
+
+**Goal:** a person who turns around, covers their face, or sits with their head
+down must not disappear from the register.
+
+**Where it stands: done, and it is the spine of the whole system** (§3).
+
+The measurement that forced it: a person facing away scored **0.06** against
+his own enrollment — below the impostor floor of ~0.25. **No threshold rescues
+that.** If identity has to be re-derived per frame, anyone who turns around
+ceases to exist. So the track owns the name, and a face only has to establish
+it once.
+
+Body structure buys four separate things, and it's worth keeping them distinct:
+
+1. **Continuity of identity** through occlusion, turning away, head-down.
+2. **Trackability at 3 fps.** What matters is box-widths-travelled-per-frame,
+   not fps. A walking face clears ~3 of its own widths between analyses (zero
+   IoU, association impossible); a body clears ~0.3. Measured ceiling for
+   reliable association: **~1.2 m/s**. A person running through frame will
+   break it — known limit, not a bug.
+3. **Honest zone membership.** Bottom-centre of a body box is the feet. The
+   face-only version used the chin, which sits at head height and put people in
+   the wrong zone depending on how they leaned.
+4. **A fallback crop for the queue.** No face ever visible? The teacher gets a
+   torso — clothing and posture are what they have to go on, and that beats no
+   crop at all.
+
+**The counter-measurement that keeps the face tracker alive:** person detection
+under-counts a packed room badly — **8 bodies against 98 faces** on this
+project's own crowd photo. Bodies alone would delete the back rows. Hence two
+trackers, namespaced by `FACE_TRACK_ID_OFFSET`.
+
+### T5 — Identification at classroom distance
+
+**Goal:** recognise 60 students from CCTV, where a face is a few dozen pixels.
+
+**Where it stands: the open problem.** See §16 — it gets its own section
+because every other target depends on it.
+
+---
+
+## 16. The real deployment: 60 students, very small faces
+
+Everything above was built and measured against stills from `data/test_faces`
+and the bedroom camera at CAMERA-IP. **The actual room is different and
+harder**, and the single number that decides success is **face width in
+pixels.**
+
+### The geometry
+
+**60 students, 15 per row, 4 rows.** Face width follows directly from
+students-per-row. A seated person is ~60 cm wide, a face ~16 cm, so a face is
+roughly **27% of the per-person width**:
+
+| Setup | Across one frame | px/person | **Face width** | Verdict |
+|---|---|---|---|---|
+| **1 camera**, 1920px | 15 | 128 px | **~34 px** | Above the ~30px floor, but only just |
+| **2 cameras**, 1920px each | ~8 | 240 px | **~64 px** | Comfortable |
+
+**Two cameras were available. Getting that second feed is worth more than any
+model change** — it roughly doubles pixels-per-face, which is the only lever
+that moves identification *and* liveness at the same time.
+
+### Why pixels-per-face is the master variable
+
+Measured on this project's photos, ArcFace genuine scores track face width
+almost linearly:
+
+| 67px | 75px | 47px | 26px | 25px |
+|---|---|---|---|---|
+| 0.4662 | 0.3916 | 0.4430 | 0.2796 | 0.2543 |
+
+Against a 0.32 threshold and an impostor floor of ~0.25–0.26. **Below ~25px,
+genuine and impostor scores overlap and identification is guesswork.**
+
+Rule of thumb: roughly **`frame_width / 45` identifiable people per row.**
+
+The same variable governs liveness at a *higher* floor (~65px, §9). So there
+are three regimes in the target room:
+
+- **> 65px** — identifiable and judgeable. Only reachable with two cameras.
+- **30–65px** — identifiable, **not** judgeable. The exposed band.
+- **< 30px** — neither. Self-cancelling for spoofing (a spoofer isn't
+  identified either) but everyone in this band lands in the unresolved queue.
+
+### `det_size` is a second, hidden downscale — check this first
+
+SCRFD runs at **640×640**. A 1920-wide frame is scaled **3× before detection**,
+so a 34px face arrives at the detector as **11px** and is simply not found. It
+never even reaches the unresolved queue.
+
+`det_size=(1280,1280)` quarters that penalty. **This is easy to mistake for a
+sensor limit when it is a config one** — check it before concluding the camera
+isn't good enough.
+
+### Enrollment: photos were denied, and that turned out to be better
+
+Individual student photos were refused on privacy grounds partway through the
+project. The gallery has to be built by **extracting faces from a clear
+recording** and labelling them `Student_01..60`, with a seating-chart pass
+later if the output ever needs to map to real people.
+
+**This is an improvement, not a setback.** A phone selfie enrolled against CCTV
+footage is a domain mismatch, and that mismatch is exactly why krish scored
+**0.2663 against his own enrollment**. Enrolling from the same camera, angle
+and lighting removes it.
+
+The clustering is nearly free, because **a ByteTrack track is a person** — it
+already carries a 30-observation averaged embedding. The job is merging a
+handful of tracks per student, not clustering raw crops. And averaging is what
+lifts small faces over threshold in the first place: **0.2663 → 0.3044** on a
+24px face, and **0.2795 → 0.4638** on a 25px face while impostors moved only
+0.2527 → 0.2629.
+
+That is why **face-size filters were deliberately removed from the pipeline.**
+Small faces are not noise to be discarded — they are the entire workload.
+
+The gallery will hold real biometric templates of real students. It lives in
+`data/`, which is gitignored. Keep it that way.
+
+### Checklist for the first real-footage session
+
+1. **`det_size` → (1280,1280)** before drawing any conclusion about range.
+2. **Two cameras** if at all possible. Nothing else doubles pixels-per-face.
+3. **Enroll from the footage**, not from photos. Merge tracks into
+   `Student_01..60`.
+4. **Re-measure the spoof threshold** at whatever `analysis_fps` ends up — it
+   is only valid at the interval it was taken at.
+5. **Count heads by hand** on a crowd frame and compare. Two silent
+   people-loss bugs passed every synthetic test and were only caught this way
+   (§13).
+6. Expect liveness to **abstain** on most of the room. That is the honest
+   result, not a failure — check `liveness_unjudged`, not just `spoofs`.
