@@ -155,7 +155,16 @@ Switch via `--gpu-profile` or `GPU_PROFILE=dev` env var.
 
 3. **FAISS in-memory**: 500 faces × 512 dimensions = ~1MB. No vector DB needed.
 
-4. **Motion-based spoof detection**: Instead of requiring a separate ONNX model, we check pixel variance in the face region across frames. Real faces have micro-movements (breathing, blinking). Printed photos/screens have near-zero variance.
+4. **Liveness by texture, with motion as the fallback**: the original design
+   checked pixel change in the face crop across frames, on the theory that real
+   faces micro-move and photos don't. Half right. Measured on this camera, a
+   live face floors at 1.40 and a static image sits at 0.00–0.06 — clean
+   separation, so print is caught. But a photo *on a screen* moved in 69% of
+   samples: LCD refresh beating against the camera shutter produces banding that
+   is indistinguishable from life by this metric, and no threshold fixes it
+   because the flicker is larger than the signal. So MiniFASNetV2 is the primary
+   when its weights are present, judging texture rather than movement, and the
+   heuristic is what runs when they aren't.
 
 5. **Frame throttling**: Analysis runs at 3 fps regardless of source framerate;
    display/recording runs at native FPS, with `BoxGlide` carrying boxes forward
@@ -171,7 +180,7 @@ ai-attendance/
 │   ├── config.py         # GPU profiles, thresholds, paths
 │   ├── pipeline.py       # Detect → Track (bodies) → Embed (faces) → Match
 │   ├── persons.py        # YOLO11 person detection + face→body association
-│   ├── antispoof.py      # Liveness/spoof detection
+│   ├── antispoof.py      # MiniFASNetV2 liveness, motion heuristic fallback
 │   ├── attendance.py     # Dwell-based presence, unresolved queue, alerts
 │   ├── dashboard.py      # WebSocket + Flask dashboard
 │   ├── reports.py        # CSV + PDF report generation
@@ -205,11 +214,29 @@ ai-attendance/
 - Recognition quality tracks pixels-per-face, not GPU. Roughly
   `frame_width / 45` identifiable people per row — ~35 at 1600px wide. Beyond
   that faces fall under ~25px and scores collapse into the impostor range.
-- Anti-spoofing via motion heuristic is basic — it catches a still printed photo
-  and nothing else; a video on a phone screen passes. `SilentFaceLiveness` in
-  antispoof.py is a stub waiting for the Silent-Face ONNX model. The flag now
-  does block attendance (a spoofed face is never marked present), so the weak
-  part is the detection, not the consequence.
+- Anti-spoofing has two modes and the good one needs a 1.74MB download:
+
+  ```bash
+  curl -L -o data/models/minifasnet_v2.onnx \
+    https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx
+  ```
+
+  With that file present, MiniFASNetV2 judges liveness from texture and the
+  motion heuristic is not used at all. Without it, the heuristic runs and
+  **anything on a screen defeats it.** That is measured, not assumed: a photo on
+  an LCD produced motion in 69% of samples, because the monitor's refresh beats
+  against the camera shutter and the banding reads as life. The threshold
+  (`spoof_pixel_movement_thresh = 1.0`) was measured the same way — 95 live
+  samples floored at 1.40, a static image sat at 0.00–0.06 — so the heuristic
+  does reliably catch a *printed* photo, and nothing else. Boot logs which mode
+  is active. Either way the flag blocks attendance; a spoofed face is never
+  marked present.
+- Re-measure the spoof threshold if `analysis_fps` changes — it is only valid
+  for the sampling interval it was taken at. `tools/calibrate_spoof.py` does it
+  in two 40s runs. Keep exactly one face in shot: with a person and a photo both
+  visible the detector finds one or the other between frames, and diffing a face
+  against a photograph poisons the result. The tool now rejects such a run
+  instead of reporting it.
 - Alert *categories* are still the original guesses. The flooding is fixed —
   repeats collapse into one row per subject with a count — but whether
   `face_hiding` (fires when a known person leaves frame for 10s+) is worth having
