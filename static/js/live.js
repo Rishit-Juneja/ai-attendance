@@ -414,7 +414,23 @@
         // actually uses. Same renderer for both sources now.
         renderAttendance(d.summary);
         const names = (d.summary.persons || []).filter(p => p.status === 'present').map(p => p.name);
-        camStatus.textContent = names.length ? 'Present: ' + names.join(', ') : 'Watching…';
+        if (d.recording && d.running) {
+          // Footage position, not elapsed wall time: analysis runs faster than
+          // real time, so a clock would race ahead of the video and mean nothing.
+          const m = Math.floor(d.pos_sec / 60), s = Math.floor(d.pos_sec % 60);
+          camStatus.textContent = `Analysing footage — ${m}:${String(s).padStart(2, '0')} in`;
+        } else {
+          camStatus.textContent = names.length ? 'Present: ' + names.join(', ') : 'Watching…';
+        }
+      }
+      if (d.done) {
+        // A recording running out is success, not the "Stream ended" failure the
+        // live path means by it. The session closed itself, so the queue below is
+        // the finished result and worth pulling once more.
+        await camStop();
+        await refreshUnresolved();
+        camStatus.textContent = 'Analysis complete — review the queue below.';
+        return;
       }
       if (!d.running) { camStatus.textContent = 'Stream ended.'; await camStop(); return; }
     } catch (err) { /* transient poll failure is not fatal */ }

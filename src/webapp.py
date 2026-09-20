@@ -572,8 +572,45 @@ def api_live_frame():
 # cv2.VideoCapture instead — no v4l2loopback, no kernel module, no root. This is
 # the same ingestion path a real camera will use.
 
-_stream = {"cap": None, "thread": None, "run": False, "frame": None, "err": None, "url": ""}
+_stream = {"cap": None, "thread": None, "run": False, "frame": None, "err": None, "url": "",
+           # Recording playback only: how far through the footage we are, and
+           # whether it ran to the end. "done" is what tells the UI the analysis
+           # finished rather than the camera dying — opposite meanings, and the
+           # old worker reported both as an error.
+           "done": False, "pos_sec": 0.0, "total_frames": 0}
 _stream_lock = threading.Lock()
+
+# Extensions OpenCV will open as a file. Anything else is treated as a live
+# source, because a recording and a camera need opposite handling on almost
+# every axis: clock, buffering, timeouts, and what the end of input means.
+_VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv", ".ts")
+
+
+def _is_recording(url: str) -> bool:
+    return not url.startswith(("rtsp", "http")) and url.lower().endswith(_VIDEO_SUFFIXES)
+
+
+def _finish_session():
+    """
+    Close the session, write its files, keep it for review. Returns
+    (session_name, unresolved_count), or (None, 0) if nothing was running.
+
+    Shared by the Stop button and the end of a recording, because a file running
+    out IS the end of the class and has to settle the books the same way. Without
+    close_session() every open visit stays open forever and the report shows the
+    whole room still sitting there.
+    """
+    global _logger, _review
+    if _logger is None:
+        return None, 0
+    _logger.close_session()
+    _write_session_files(_logger)
+    # Kept for review, not discarded: naming the unresolved people is the work
+    # that happens after the class, and it rewrites these same files.
+    _review = _logger
+    session_name = _logger.session_name
+    _logger = None
+    return session_name, len(_review.unresolved)
 
 
 class BoxGlide:
@@ -627,21 +664,33 @@ class BoxGlide:
 def _stream_worker(url: str):
     """Pull frames, run the pipeline, keep the latest annotated frame for the feed."""
     global _logger
+    is_file = _is_recording(url)
     if url.startswith("rtsp"):
         # OpenCV/FFmpeg default RTSP to UDP, which drops packets and smears
         # macroblocks across faces on a shared LAN. TCP costs nothing here.
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
     cap = cv2.VideoCapture(url)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency at one frame, not a backlog
-    # Don't let a dead camera wedge the worker forever.
-    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+    if not is_file:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency at one frame, not a backlog
+        # Don't let a dead camera wedge the worker forever. Meaningless on a file,
+        # and dropping frames from one would silently skip footage.
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
     if not cap.isOpened():
         _stream["err"] = f"Could not open stream: {url}"
         _stream["run"] = False
         return
 
     _stream["cap"] = cap
+    _stream["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if is_file else 0
+    # Video position is seconds-from-zero, which is right for every duration and
+    # useless as a time of day — reports rendered "entered 05:30:01" because
+    # second 0 is the 1970 epoch. Anchoring to the wall clock at analysis start
+    # keeps durations identical (they are differences) and makes the timestamps
+    # readable and correctly ordered. They are NOT the real class times: nothing
+    # in the file says when it was filmed, and the camera's own clock reads
+    # 2000-01-01. Treat recording timestamps as offsets from when it was run.
+    t_zero = time.time()
     pipeline = get_pipeline()
     misses = 0
     last_dets = []
@@ -649,6 +698,12 @@ def _stream_worker(url: str):
     while _stream["run"]:
         ok, frame = cap.read()
         if not ok:
+            if is_file:
+                # A file ending is the normal, expected outcome, not a fault. It is
+                # also the only moment the last visit can be closed honestly — see
+                # AttendanceLogger.close_session.
+                _stream["done"] = True
+                break
             misses += 1
             if misses > 30:
                 _stream["err"] = "Stream ended or camera unreachable."
@@ -656,10 +711,20 @@ def _stream_worker(url: str):
             continue
         misses = 0
 
+        # A recording is driven by its own clock, not the wall's. Read at disk
+        # speed the wall clock would admit 3 frames per real second while minutes
+        # of footage streamed past unanalysed, and would then measure everyone's
+        # dwell against the few minutes the crunch took rather than the class.
+        if is_file:
+            pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            _stream["pos_sec"] = pos        # raw position, for the progress readout
+            now = t_zero + pos
+        else:
+            now = time.time()
         # Throttle analysis to the profile's fps; the feed still shows every frame.
-        now = time.time()
-        if pipeline.should_analyze():
-            result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker())
+        if pipeline.should_analyze(now if is_file else None):
+            result = pipeline.process_frame(frame, spoof_checker=get_spoof_checker(),
+                                            timestamp=now if is_file else None)
             last_dets = result.detections
             glide.observe(last_dets, now)
             if _logger is not None:
@@ -685,6 +750,11 @@ def _stream_worker(url: str):
     cap.release()
     _stream["cap"] = None
     _stream["run"] = False
+    if _stream["done"]:
+        # The recording ran out, so the class is over. Settling here rather than
+        # waiting for a Stop press matters because the analysis may have finished
+        # unattended — a 40-minute class crunches through in minutes.
+        _finish_session()
 
 
 @app.route("/api/zones", methods=["GET", "POST"])
@@ -730,9 +800,18 @@ def api_live_stream_start():
     if not url:
         return jsonify({"ok": False, "error": "A camera URL is required."}), 400
 
-    # IP Webcam-style apps serve the stream at /video; accept the bare host too.
-    # Normalize before the running-check so the same camera compares equal.
-    if url.startswith("http") and not any(url.rstrip("/").endswith(s) for s in ("/video", ".mjpg", ".mjpeg", "/videofeed")):
+    # A recording is a first-class source: the classroom footage arrives as files,
+    # and enrolment has to be built from them because student photos were refused.
+    # Resolve to an absolute path so the error names what was actually looked for
+    # rather than something relative to wherever the server happened to start.
+    if _is_recording(url):
+        path = Path(url).expanduser().resolve()
+        if not path.is_file():
+            return jsonify({"ok": False, "error": f"No such recording: {path}"}), 400
+        url = str(path)
+    elif url.startswith("http") and not any(url.rstrip("/").endswith(s) for s in ("/video", ".mjpg", ".mjpeg", "/videofeed")):
+        # IP Webcam-style apps serve the stream at /video; accept the bare host too.
+        # Normalize before the running-check so the same camera compares equal.
         url = url.rstrip("/") + "/video"
 
     if _stream["run"]:
@@ -745,14 +824,16 @@ def api_live_stream_start():
         return jsonify({"ok": False,
                         "error": f"Already streaming {_stream['url']}. Stop it first."}), 400
 
-    _logger = AttendanceLogger(session_name=f"cam_{datetime.now():%Y%m%d_%H%M%S}", config=_config)
+    tag = "rec" if _is_recording(url) else "cam"
+    _logger = AttendanceLogger(session_name=f"{tag}_{datetime.now():%Y%m%d_%H%M%S}", config=_config)
     pipeline = get_pipeline()
     pipeline.reset_tracker()
     _spoof_checker = SpoofChecker(
         movement_threshold=_config.spoof_pixel_movement_thresh,
         flag_after_n=_config.spoof_frame_count,
     )
-    _stream.update(run=True, err=None, frame=None, url=url)
+    _stream.update(run=True, err=None, frame=None, url=url,
+                   done=False, pos_sec=0.0, total_frames=0)
     _stream["thread"] = threading.Thread(target=_stream_worker, args=(url,), daemon=True)
     _stream["thread"].start()
     return jsonify({"ok": True, "url": url, "session": _logger.session_name})
@@ -781,12 +862,19 @@ def api_live_snapshot():
 
 @app.route("/api/live/stream_status")
 def api_live_stream_status():
+    # A finished recording has run=False and err=None, which is indistinguishable
+    # from "never started" unless `done` is reported. The summary comes from the
+    # review logger once the session has been settled, or the whole analysis
+    # would appear to vanish the moment it completed.
     return jsonify({
         "ok": True,
         "running": _stream["run"],
         "url": _stream["url"],
         "error": _stream["err"],
-        "summary": _logger.get_summary() if _logger else None,
+        "done": _stream["done"],
+        "recording": _is_recording(_stream["url"]),
+        "pos_sec": round(_stream["pos_sec"], 1),
+        "summary": (_logger or _review).get_summary() if (_logger or _review) else None,
     })
 
 
@@ -858,19 +946,10 @@ def _write_session_files(log):
 
 @app.route("/api/live/stop", methods=["POST"])
 def api_live_stop():
-    global _logger, _review
     if _logger is None:
         return jsonify({"ok": False, "error": "No active session."}), 400
-
-    _logger.close_session()
-    _write_session_files(_logger)
-    # Kept for review, not discarded: naming the unresolved people is the work
-    # that happens after the class, and it rewrites these same files.
-    _review = _logger
-    session_name = _logger.session_name
-    _logger = None
-    return jsonify({"ok": True, "session": session_name,
-                    "unresolved": len(_review.unresolved)})
+    session_name, unresolved = _finish_session()
+    return jsonify({"ok": True, "session": session_name, "unresolved": unresolved})
 
 
 def main():

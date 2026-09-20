@@ -29,13 +29,16 @@
         <button class="btn btn-outline" id="stop-btn" disabled>Stop &amp; save log</button>
       </div>
       <div class="section-gap">
-        <label class="field-label" for="cam-url">Network camera (phone app or CCTV)</label>
+        <label class="field-label" for="cam-url">Network camera, or a recording to analyse</label>
         <div style="display:flex;gap:.5rem;">
-          <input type="text" id="cam-url" style="flex:1;" placeholder="http://192.168.0.50:8080  or  rtsp://user:pass@192.168.0.60:554/stream1">
+          <input type="text" id="cam-url" style="flex:1;" placeholder="rtsp://CAMERA-IP:554/stream1   or   /home/you/footage/class.mp4">
           <button class="btn btn-outline" id="cam-btn">Connect</button>
         </div>
         <p class="hint" style="margin-top:.4rem;">Runs server-side — no browser camera permission needed. For an
         MJPEG phone app just paste the host, <code>/video</code> is added automatically.</p>
+        <p class="hint">Paste a <strong>video file path</strong> to analyse a recording instead. It runs as fast as
+        the GPU allows — dwell is measured in footage time, not how long the crunch took — and closes the session
+        itself at the end, so the review queue below is ready when it finishes.</p>
         <p class="hint" id="cam-status"></p>
       </div>
       <div class="section-gap">

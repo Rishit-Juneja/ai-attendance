@@ -96,7 +96,7 @@ Files, by responsibility:
 | `tools/verify_spoof_model.py` | Scores real images or live frames through the model |
 | `tools/export_person_model.py` | Produces `yolo11n.onnx` (needs torch; one-off) |
 | `tools/measure_det_size.py` | Usable faces vs detect time per `det_size`. Run on real footage |
-| `test_matching.py` | 33 tests covering every non-trivial rule below |
+| `test_matching.py` | 35 tests covering every non-trivial rule below |
 
 ---
 
@@ -525,9 +525,9 @@ target image/video) · `/live` (stream, zone editor, unresolved queue).
 | `/api/gallery` | GET/POST | List / enrol a person |
 | `/api/gallery/<roll>` | DELETE | Remove, rebuild index |
 | `/api/zones` | GET/POST | Read / save polygon zones |
-| `/api/live/stream_start` | POST | Open RTSP, start the worker thread |
+| `/api/live/stream_start` | POST | Open an RTSP/HTTP camera **or a video file path**, start the worker |
 | `/api/live/snapshot` | GET | Latest annotated frame (drives the feed) |
-| `/api/live/stream_status` | GET | Running / error state |
+| `/api/live/stream_status` | GET | Running / error state, plus `done` + `pos_sec` for a recording |
 | `/api/live/stream_stop` | POST | Stop the stream, keep the session |
 | `/api/live/start` | POST | Begin an attendance session |
 | `/api/live/frame` | POST | Push a browser-webcam frame (no RTSP path) |
@@ -542,8 +542,47 @@ macroblocks across faces on a shared LAN. `CAP_PROP_BUFFERSIZE=1` keeps latency
 at one frame instead of a backlog; open/read timeouts are 5s so a dead camera
 can't wedge the worker.
 
+### Analysing a recording
+
+Paste a **video file path** into the same box as a camera URL. This is the path
+that matters for deployment: the classroom footage arrives as files, and the
+gallery has to be built from them because student photos were refused (§16).
+
+`_is_recording()` decides by extension, and a file is handled as the opposite of
+a camera on nearly every axis:
+
+| | Live camera | Recording |
+|---|---|---|
+| Clock | wall clock | the video's own `CAP_PROP_POS_MSEC` |
+| Buffering | `BUFFERSIZE=1`, 5s timeouts | none — dropping a frame would skip footage |
+| End of input | error after 30 misses | success; closes the session itself |
+| Speed | camera rate | as fast as the GPU manages (measured ~6× real time) |
+
+**The clock is the whole feature.** Both `should_analyze()` and
+`process_frame()` took the wall clock unconditionally, and both are wrong for a
+file. The throttle would admit 3 frames per *real* second while minutes of
+footage streamed past unexamined; and every duration downstream — `min_dwell_sec`,
+`exit_grace_sec`, `hiding_alert_after_sec` — would be measured against how long
+the crunch took rather than the class. A 40-minute class analysed in 4 minutes
+credited everyone 4 minutes of dwell and the entire room came out `brief`. Both
+now take an optional clock and default to wall time, so the live path is
+untouched.
+
+**Recording timestamps are offsets, not real times.** Video position starts at
+0.0, which rendered as `05:30:01` in the queue — the 1970 epoch in local time.
+They are anchored to the wall clock when analysis *started*, so durations are
+unaffected (they are differences) and times read sensibly and sort correctly.
+Nothing in the file says when it was filmed and the camera's own clock reads
+2000-01-01 (§1), so do not read a recording's timestamps as class times.
+
+A file running out closes the session through `_finish_session()` — the same
+path as the Stop button, because the footage ending *is* the end of class and
+has to settle the books identically. It matters that this is automatic: the
+analysis finishes faster than real time and usually unattended.
+
 Session output lands in `data/logs/<session>/`: `attendance.json`,
 `attendance.csv`, unresolved crops, plus the daily CSV/PDF in `data/reports/`.
+Recording sessions are named `rec_<timestamp>`, camera ones `cam_<timestamp>`.
 
 ---
 
@@ -575,7 +614,7 @@ Profile switch: `GPU_PROFILE=demo python -m src.webapp`.
 ## 13. Tests
 
 ```fish
-python test_matching.py     # 33 tests, all green
+python test_matching.py     # 35 tests, all green
 python -m src.zones         # zones self-check
 ```
 

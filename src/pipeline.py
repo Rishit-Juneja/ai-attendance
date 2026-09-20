@@ -419,7 +419,9 @@ class Pipeline:
         self.zones = load_zones()  # empty list = whole frame counts
 
         self._frame_interval = 1.0 / profile.analysis_fps
-        self._last_analysis_time = 0.0
+        # None, not 0.0 — a recording's clock starts at 0.0, so a zero here made
+        # the very first frame of a file fail the interval test and get skipped.
+        self._last_analysis_time = None
         self._frame_idx = 0
 
     def reset_tracker(self):
@@ -457,15 +459,43 @@ class Pipeline:
     def load_gallery(self, index_path: str, meta_path: str, live_only: bool = False):
         self.matcher = GalleryMatcher(index_path, meta_path, live_only=live_only)
 
-    def should_analyze(self) -> bool:
-        now = time.monotonic()
-        if now - self._last_analysis_time >= self._frame_interval:
+    def should_analyze(self, now: float | None = None) -> bool:
+        """
+        Throttle to analysis_fps. `now` defaults to the wall clock, which is right
+        for a live camera and wrong for a recording: read a file at disk speed and
+        the wall clock lets through 3 frames per real second while hundreds of
+        video seconds stream past unexamined. Pass the video's own position
+        instead and the rate means 3 frames per second *of footage*, however fast
+        the machine gets through it.
+        """
+        now = time.monotonic() if now is None else now
+        if self._last_analysis_time is None:
             self._last_analysis_time = now
             return True
-        return False
+        if now - self._last_analysis_time < self._frame_interval:
+            return False
+        # Advance BY the interval rather than snapping to the frame that happened
+        # to cross it. Snapping throws away the sub-frame remainder every time and
+        # the error compounds: measured 2.81 analyses/sec against a target of 3 on
+        # 30fps footage, i.e. 6% of the analysis budget lost to rounding.
+        self._last_analysis_time += self._frame_interval
+        # Unless the source genuinely stalled — a wedged camera, or a seek. Resync
+        # instead of firing one catch-up analysis per missed interval in a burst.
+        if now - self._last_analysis_time >= self._frame_interval:
+            self._last_analysis_time = now
+        return True
 
-    def process_frame(self, frame: np.ndarray, spoof_checker=None) -> FrameResult:
+    def process_frame(self, frame: np.ndarray, spoof_checker=None,
+                      timestamp: float | None = None) -> FrameResult:
+        """
+        `timestamp` is what every downstream duration is measured against — dwell,
+        the 60s exit grace, the hiding alert. Default wall clock for a live feed;
+        for a recording pass the frame's own position in the video, or a 40-minute
+        class crunched through in 4 minutes credits everyone 4 minutes of dwell
+        and the whole room comes out `brief`.
+        """
         t0 = time.time()
+        stamp = time.time() if timestamp is None else timestamp
         self._frame_idx += 1
         profile = self.config.profile
 
@@ -532,7 +562,7 @@ class Pipeline:
         if not rows:
             return FrameResult(
                 frame_idx=self._frame_idx,
-                timestamp=time.time(),
+                timestamp=stamp,
                 detections=[],
                 inference_ms=(time.time() - t0) * 1000,
             )
@@ -591,7 +621,7 @@ class Pipeline:
 
         return FrameResult(
             frame_idx=self._frame_idx,
-            timestamp=time.time(),
+            timestamp=stamp,
             detections=detections,
             inference_ms=(time.time() - t0) * 1000,
             num_tracked=len(detections),

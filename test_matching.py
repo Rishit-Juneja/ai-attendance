@@ -463,6 +463,70 @@ def test_zone_membership_uses_feet_not_chin():
         f"{dets[0].zone if dets else 'no detections'}")
 
 
+def test_a_recording_is_analysed_on_its_own_clock_not_the_wall_clock():
+    """
+    The whole point of feeding a recording in: a 40-minute class crunched through
+    in 4 minutes must still credit 40 minutes of dwell.
+
+    Both halves are wall-clock by default and both are wrong for a file.
+    should_analyze() lets 3 frames per REAL second through, so reading at disk
+    speed skips almost all the footage; and process_frame stamps detections with
+    time.time(), so min_dwell_sec and exit_grace_sec end up measured against how
+    long the crunch took. Everyone lands on 'brief' and the register is empty.
+    """
+    from src.pipeline import Pipeline
+
+    pipe = Pipeline.__new__(Pipeline)     # no models; only the throttle is under test
+    pipe._frame_interval = 1.0 / 3
+    pipe._last_analysis_time = None
+
+    # A file's clock starts at exactly 0.0. A zero sentinel swallowed frame one.
+    assert pipe.should_analyze(0.0), "first frame of a recording was skipped"
+    assert not pipe.should_analyze(0.1), "analysed twice within one 3 fps interval"
+    assert pipe.should_analyze(0.4), "1/3s of footage elapsed, should analyse"
+
+    # Wall time is irrelevant to a file: the analysis count is set by how much
+    # FOOTAGE went past, not by how long the machine took to chew it.
+    pipe._last_analysis_time = None
+    ten_min = sum(pipe.should_analyze(i / 30.0) for i in range(30 * 600))
+    pipe._last_analysis_time = None
+    twenty_min = sum(pipe.should_analyze(i / 30.0) for i in range(30 * 1200))
+    assert abs(twenty_min - 2 * ten_min) <= 2, "analysis count not proportional to footage"
+
+    # Actually 3, not 2.81. Snapping _last_analysis_time to the frame that
+    # crossed the interval used to discard the sub-frame remainder each time and
+    # compound it away — 6% of the analysis budget lost to rounding.
+    assert 2.98 <= ten_min / 600 <= 3.02, f"{ten_min / 600:.3f} analyses/sec of footage"
+
+    # A stalled source must resync, not fire one catch-up analysis per missed
+    # interval the moment it recovers.
+    pipe._last_analysis_time = None
+    pipe.should_analyze(0.0)
+    assert sum(pipe.should_analyze(100.0 + i / 30.0) for i in range(30)) <= 4, \
+        "burst of catch-up analyses after a gap"
+
+
+def test_recording_dwell_is_credited_from_video_time():
+    """
+    The downstream half of the same bug: the logger must be fed the video's
+    timestamps. Ten minutes of footage makes someone present even if the
+    analysis itself finished in seconds.
+    """
+    from src.attendance import AttendanceLogger
+
+    log = AttendanceLogger(session_name="_test_recording_clock")
+    # 10 minutes of footage, sampled at 3 fps, stamped with video position.
+    for i in range(0, 600 * 3):
+        log.process_detections([_Det(name="Krish", roll="K1")], i, i / 3.0)
+    log.close_session()
+
+    rec = log.records["K1"]
+    assert rec.duration_sec >= 599, (
+        f"{rec.duration_sec:.0f}s credited from 600s of footage — "
+        "dwell was measured against the wrong clock")
+    assert rec.status in ("present", "left"), rec.status
+
+
 class _Det:
     """Minimal stand-in for pipeline.Detection."""
 
