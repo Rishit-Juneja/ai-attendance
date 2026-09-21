@@ -27,7 +27,7 @@ from flask import Flask, Response, jsonify, render_template, request, send_file,
 
 from . import enroll as enroll_mod
 from .antispoof import SpoofChecker
-from .attendance import AttendanceLogger
+from .attendance import AttendanceLogger, recording_start_time
 from .config import (
     Config,
     ENROLLMENT_DIR,
@@ -685,12 +685,15 @@ def _stream_worker(url: str):
     _stream["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if is_file else 0
     # Video position is seconds-from-zero, which is right for every duration and
     # useless as a time of day — reports rendered "entered 05:30:01" because
-    # second 0 is the 1970 epoch. Anchoring to the wall clock at analysis start
-    # keeps durations identical (they are differences) and makes the timestamps
-    # readable and correctly ordered. They are NOT the real class times: nothing
-    # in the file says when it was filmed, and the camera's own clock reads
-    # 2000-01-01. Treat recording timestamps as offsets from when it was run.
-    t_zero = time.time()
+    # second 0 is the 1970 epoch. Anchor it so timestamps read as times of day.
+    #
+    # Anchored to when the footage was FILMED, not to when analysis started. The
+    # camera's own clock reads 2000-01-01, but the NVR puts the capture time in
+    # the filename, and per-lecture attendance needs it: scored against the wall
+    # clock, this morning's 09:00 class analysed tonight lands at 22:00 and
+    # matches no lecture in the timetable. Durations are differences and are
+    # unaffected either way.
+    t_zero = recording_start_time(url) if is_file else time.time()
     # Annotated output, recordings only. The browser feed polls single JPEGs at
     # ~8fps of WALL time while a file is analysed at several times real speed —
     # measured 2.8x on 1080p with 35 faces, so a viewer sees about 1 frame in 13

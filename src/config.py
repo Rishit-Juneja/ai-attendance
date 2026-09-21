@@ -114,6 +114,16 @@ class Config:
     # much time inside a zone, across however many visits. Walking past the door
     # no longer marks you present, which the old "seen in 3 frames" rule did.
     min_dwell_sec: float = 30.0
+    # Timetable, as wall-clock spans. Empty = no slicing, and a session is scored
+    # as one block exactly as before. NOT generated hourly: A607's own footage has
+    # the room full at 09:59:56 and empty at 10:30:55, so an on-the-hour boundary
+    # would cut a running lecture in half. Fill these in from the real timetable.
+    #   lectures = ("09:00-10:30", "10:45-12:15")
+    lectures: tuple = ()
+    # Per-lecture bar for being marked present. Distinct from min_dwell_sec below,
+    # which is a noise floor ("was in the room" vs "walked past the door"); this
+    # one is policy ("attended enough of the lecture to count").
+    lecture_min_dwell_sec: float = 1800.0       # 30 minutes
     # A visit stays open across gaps shorter than this, so the gap is credited as
     # dwell. Deliberately generous: in a classroom a student with their head down
     # or turned away loses their face for a minute at a time and is still sitting

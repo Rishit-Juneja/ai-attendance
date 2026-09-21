@@ -11,6 +11,7 @@ the unresolved queue with the same dwell accounting, and a teacher assigns the
 real identity afterwards via resolve(), which back-dates the attendance.
 """
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,6 +22,41 @@ from .config import LOGS_DIR
 
 def _hms(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+# NVR exports carry the capture time in the filename. Dahua/CP-Plus write
+#   10.20.30.40_ch5_20260921090256_20260921120411.asf
+# i.e. <start><end> as 14-digit stamps. Anchored, not greedy, so the dotted IP
+# in front cannot contribute digits.
+_FILENAME_STAMP = re.compile(r"(?<!\d)(\d{14})(?!\d)")
+
+
+def recording_start_time(path: str, fallback: float | None = None) -> float:
+    """
+    Wall-clock epoch at which this footage was FILMED.
+
+    Why it matters: dwell is measured against a timetable ("was this student in
+    the 09:00 lecture"), and a recording analysed at 22:30 would otherwise stamp
+    a 09:00 class with tonight's hour and match no lecture at all.
+
+    The old note here said nothing in the file records when it was filmed. That
+    was true of the camera's own clock -- which reads 2000-01-01 -- but not of
+    the NVR's filename, which carries the start stamp exactly.
+
+    Falls back to mtime, which for an exported file is usually the moment the
+    export FINISHED: wrong by the length of the recording, but the right day and
+    roughly the right hour, which still beats the wall clock at analysis time.
+    """
+    m = _FILENAME_STAMP.search(Path(path).name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").timestamp()
+        except ValueError:
+            pass        # 14 digits that are not a date; fall through
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return time.time() if fallback is None else fallback
 
 
 @dataclass
@@ -34,6 +70,65 @@ class Visit:
     @property
     def seconds(self) -> float:
         return max(0.0, self.last_seen - self.entered)
+
+
+def dwell_between(visits: list[Visit], start: float, end: float) -> float:
+    """
+    Seconds of these visits falling inside [start, end).
+
+    Visits are CLIPPED to the window, never counted whole: a student seated from
+    09:50 to 10:40 is credited 10 minutes to a lecture ending at 10:00 and 40 to
+    the next one, not 50 to both.
+
+    Gaps BETWEEN visits are simply absent from the sum, which is why a washroom
+    trip needs no special case anywhere in this file. Leaving closes one visit,
+    returning opens another, and only the two in-room stretches are added up --
+    so a 10-minute absence from a 60-minute lecture leaves 50 minutes of dwell
+    and the student still clears a 30-minute bar.
+    """
+    return sum(max(0.0, min(v.last_seen, end) - max(v.entered, start))
+               for v in visits)
+
+
+@dataclass
+class Lecture:
+    name: str
+    start: float        # epoch
+    end: float
+
+    @property
+    def minutes(self) -> float:
+        return (self.end - self.start) / 60.0
+
+
+def parse_lectures(spans, day: datetime = None) -> list[Lecture]:
+    """
+    Turn ("09:00-10:30", "10:45-12:15") into epoch windows on `day` (default today).
+
+    Wall-clock strings rather than offsets from session start, because a
+    timetable belongs to the institution and a session does not: the same string
+    has to name the same lecture whether it is applied to a live feed now or to
+    a recording analysed this evening. That only holds if recording timestamps
+    are anchored to capture time -- see recording_start_time().
+
+    Spans are taken as given, not assumed hourly. A607's own footage shows the
+    room full at 09:59:56 and empty at 10:30:55, so a boundary generated on the
+    hour would cut straight through a lecture that was still running.
+    """
+    base = (day or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for span in spans:
+        try:
+            lo, hi = (s.strip() for s in span.split("-", 1))
+            h1, m1 = (int(v) for v in lo.split(":"))
+            h2, m2 = (int(v) for v in hi.split(":"))
+        except ValueError:
+            continue    # malformed entry must not take the whole timetable down
+        start = base.timestamp() + h1 * 3600 + m1 * 60
+        end = base.timestamp() + h2 * 3600 + m2 * 60
+        if end > start:
+            out.append(Lecture(name=span, start=start, end=end))
+    return out
 
 
 @dataclass
@@ -487,6 +582,63 @@ class AttendanceLogger:
             ],
         }
 
+    def per_lecture(self, lectures: list[Lecture], min_dwell_sec: float = None) -> list[dict]:
+        """
+        Attendance sliced per lecture, from the visits already recorded.
+
+        Deliberately a pure read over `self.records` rather than new state in the
+        tracker: a visit already carries absolute entry and exit times, so which
+        lecture it belongs to is arithmetic, not something to observe. Re-running
+        this with a corrected timetable re-scores a finished session for free.
+
+        `min_dwell_sec` is the per-lecture bar (default config.lecture_min_dwell_sec,
+        1800s) and is a different quantity from the logger's own min_dwell_sec,
+        which is a 30-second noise floor separating "was here" from "walked past".
+
+        Absence is only meaningful RELATIVE TO THE PEOPLE SEEN THAT DAY. Someone
+        who never appeared on any camera has no record here and cannot be listed
+        absent -- that needs the enrolled roster, which this class does not hold.
+        """
+        if min_dwell_sec is None:
+            from .config import DEFAULT_CONFIG
+            min_dwell_sec = getattr(DEFAULT_CONFIG, "lecture_min_dwell_sec", 1800.0)
+
+        out = []
+        for lec in lectures:
+            rows = []
+            for r in self.records.values():
+                dwell = dwell_between(r.visits, lec.start, lec.end)
+                # Visits touching this window at all, for the in/out trail.
+                spans = [v for v in r.visits
+                         if v.last_seen > lec.start and v.entered < lec.end]
+                rows.append({
+                    "name": r.name,
+                    "roll": r.roll,
+                    "dwell_sec": round(dwell, 1),
+                    "dwell_min": round(dwell / 60, 1),
+                    # Share of the lecture actually attended -- the number a
+                    # 75%-attendance rule would be applied to.
+                    "share": round(dwell / max(lec.end - lec.start, 1e-6), 3),
+                    "status": ("present" if dwell >= min_dwell_sec
+                               else "partial" if dwell > 0 else "absent"),
+                    "in_out": [[_hms(max(v.entered, lec.start)),
+                                _hms(min(v.last_seen, lec.end))] for v in spans],
+                    "spoofs": r.spoof_flags,
+                })
+            rows.sort(key=lambda x: -x["dwell_sec"])
+            out.append({
+                "lecture": lec.name,
+                "start": _hms(lec.start),
+                "end": _hms(lec.end),
+                "minutes": round(lec.minutes, 1),
+                "min_dwell_sec": min_dwell_sec,
+                "present": sum(1 for x in rows if x["status"] == "present"),
+                "partial": sum(1 for x in rows if x["status"] == "partial"),
+                "absent": sum(1 for x in rows if x["status"] == "absent"),
+                "students": rows,
+            })
+        return out
+
     def save_log(self):
         summary = self.get_summary()
         log_path = self.log_dir / "attendance.json"
@@ -518,3 +670,60 @@ class AttendanceLogger:
                 ])
         print(f"[CSV] Saved to {path}")
         return path
+
+
+if __name__ == "__main__":
+    # Self-check: the window arithmetic and the capture-time anchor. Both fail
+    # silently in production -- a wrong boundary just moves attendance to the
+    # neighbouring lecture, and a wrong anchor scores every lecture as empty.
+    DAY = datetime(2026, 9, 21)
+    NINE = DAY.replace(hour=9).timestamp()
+
+    def v(h1, m1, h2, m2, closed=True):
+        return Visit(entered=DAY.replace(hour=h1, minute=m1).timestamp(),
+                     last_seen=DAY.replace(hour=h2, minute=m2).timestamp(),
+                     closed=closed)
+
+    lec1, lec2 = parse_lectures(("09:00-10:00", "10:00-11:00"), DAY)
+    assert lec1.start == NINE, "09:00 must anchor to 09:00 on the given day"
+    assert lec1.minutes == 60.0
+
+    # Clipping: one visit straddling the boundary splits, never double-counts.
+    straddle = [v(9, 50, 10, 40)]
+    assert dwell_between(straddle, lec1.start, lec1.end) == 600.0
+    assert dwell_between(straddle, lec2.start, lec2.end) == 2400.0
+
+    # Disjoint in both directions scores zero, not a negative.
+    assert dwell_between([v(11, 0, 11, 30)], lec1.start, lec1.end) == 0.0
+    assert dwell_between([v(7, 0, 8, 0)], lec1.start, lec1.end) == 0.0
+
+    # THE washroom case: out at 09:20, back at 09:30. Two visits, 50 minutes
+    # total, still present against a 30-minute bar -- with no special casing.
+    loo = [v(9, 0, 9, 20), v(9, 30, 10, 0)]
+    assert dwell_between(loo, lec1.start, lec1.end) == 3000.0
+
+    log = AttendanceLogger(session_name="_selfcheck")
+    log.records["0001"] = PersonRecord(name="Present", roll="0001", visits=loo)
+    log.records["0002"] = PersonRecord(name="Brief", roll="0002", visits=[v(9, 5, 9, 9)])
+    log.records["0003"] = PersonRecord(name="Elsewhere", roll="0003", visits=[v(11, 0, 11, 5)])
+    [rep] = log.per_lecture([lec1], min_dwell_sec=1800.0)
+    got = {s["name"]: s["status"] for s in rep["students"]}
+    assert got == {"Present": "present", "Brief": "partial", "Elsewhere": "absent"}, got
+    assert (rep["present"], rep["partial"], rep["absent"]) == (1, 1, 1)
+    assert rep["students"][0]["share"] == round(3000 / 3600, 3)
+    # Both stretches shown, so a teacher can see the gap rather than infer it.
+    assert len(rep["students"][0]["in_out"]) == 2
+
+    # Capture time comes off the NVR filename, not the clock or the mtime.
+    real = "10.20.30.40_ch5_20260921090256_20260921120411.asf"
+    assert recording_start_time(real) == datetime(2026, 9, 21, 9, 2, 56).timestamp()
+    # The dotted IP must not be mined for digits, and a bad stamp must not raise.
+    assert recording_start_time("cam_99999999999999_x.mp4", fallback=1.0) == 1.0
+    assert recording_start_time("no_stamp_here.mp4", fallback=1.0) == 1.0
+
+    assert parse_lectures(("bogus", "09:00-10:00"), DAY) == [lec1], "bad span must be skipped"
+    assert parse_lectures(("10:00-09:00",), DAY) == [], "backwards span must be dropped"
+
+    import shutil
+    shutil.rmtree(log.log_dir, ignore_errors=True)
+    print("attendance.py self-check passed")
