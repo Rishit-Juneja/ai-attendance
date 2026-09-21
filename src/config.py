@@ -121,10 +121,11 @@ class Config:
     # 09:59:56 and empty at 10:30:55, which is the 09:30 period ending, not a
     # 10:00 one. Boundaries generated on :00 would have cut every period in half.
     #
-    # Lunch, free periods and lab slots are not marked because they are not known
-    # yet. They do not need to be: a period nobody attends simply scores everyone
-    # absent, so running a full day and reading off the near-empty periods is how
-    # you find out which ones they are.
+    # Lunch, free periods and labs are not marked, and do not need to be. Labs
+    # run in another room where the students are marked by that room's camera, so
+    # an idle A607 during one is NOT sixty absences — per_lecture() reports such
+    # a period as no_session and records no verdict against anybody. A full day's
+    # run is therefore also how you discover which periods these are.
     lectures: tuple = (
         "09:30-10:30", "10:30-11:30", "11:30-12:30", "12:30-13:30",
         "13:30-14:30", "14:30-15:30", "15:30-16:30",

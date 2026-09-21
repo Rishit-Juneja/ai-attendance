@@ -237,6 +237,11 @@ class AttendanceLogger:
 
         self.records: dict[str, PersonRecord] = {}      # keyed by roll
         self.unresolved: dict[int, Unresolved] = {}     # keyed by track_id
+        # Analysed time span, detections or not. Without it a lecture window that
+        # the footage never reached is indistinguishable from one the whole class
+        # skipped, and per_lecture() would report both as everybody absent.
+        self._first_ts: float | None = None
+        self._last_ts: float | None = None
         self._person_seq = 0
         self.alerts: list[Alert] = []
         self.frame_log: list[dict] = []
@@ -262,6 +267,12 @@ class AttendanceLogger:
         Fold one analysed frame into the records. `frame` is optional and only
         used to save a face crop for the unresolved queue.
         """
+        # Recorded before the loop, so an analysed frame with nobody in it still
+        # counts as coverage — an empty room is evidence, not a gap.
+        if self._first_ts is None:
+            self._first_ts = timestamp
+        self._last_ts = timestamp
+
         # (detection, face box) for everyone whose face is actually visible.
         # Body boxes are useless for the overlap check — two people standing side
         # by side overlap heavily and are not a photo spoof.
@@ -605,6 +616,19 @@ class AttendanceLogger:
 
         out = []
         for lec in lectures:
+            # Three different things look identical in the numbers and must not
+            # be reported alike, because a false absence costs a real student:
+            #
+            #   no_data    the footage never covered this window at all
+            #   no_session the room was analysed and stayed empty -- a lab in
+            #              another room, a free period, or lunch. The cohort is
+            #              elsewhere being marked by somebody else, NOT absent.
+            #   normal     somebody was here, so absences mean something
+            #
+            # Distinguishing them needs no timetable annotation: a whole cohort
+            # absent at once is implausible, an idle room is routine.
+            covered = (self._first_ts is not None
+                       and self._last_ts > lec.start and self._first_ts < lec.end)
             rows = []
             for r in self.records.values():
                 dwell = dwell_between(r.visits, lec.start, lec.end)
@@ -626,12 +650,20 @@ class AttendanceLogger:
                     "spoofs": r.spoof_flags,
                 })
             rows.sort(key=lambda x: -x["dwell_sec"])
+            seen = sum(1 for x in rows if x["dwell_sec"] > 0)
+            state = "normal" if seen else ("no_session" if covered else "no_data")
+            if state != "normal":
+                # Blank the per-student verdicts rather than leave 60 rows
+                # reading "absent" for a period this room was not hosting.
+                for x in rows:
+                    x["status"] = state
             out.append({
                 "lecture": lec.name,
                 "start": _hms(lec.start),
                 "end": _hms(lec.end),
                 "minutes": round(lec.minutes, 1),
                 "min_dwell_sec": min_dwell_sec,
+                "state": state,
                 "present": sum(1 for x in rows if x["status"] == "present"),
                 "partial": sum(1 for x in rows if x["status"] == "partial"),
                 "absent": sum(1 for x in rows if x["status"] == "absent"),
@@ -703,6 +735,8 @@ if __name__ == "__main__":
     assert dwell_between(loo, lec1.start, lec1.end) == 3000.0
 
     log = AttendanceLogger(session_name="_selfcheck")
+    # Coverage as a recording would set it: analysed 09:00-11:00 and no further.
+    log._first_ts, log._last_ts = lec1.start, lec2.end
     log.records["0001"] = PersonRecord(name="Present", roll="0001", visits=loo)
     log.records["0002"] = PersonRecord(name="Brief", roll="0002", visits=[v(9, 5, 9, 9)])
     log.records["0003"] = PersonRecord(name="Elsewhere", roll="0003", visits=[v(11, 0, 11, 5)])
@@ -713,6 +747,22 @@ if __name__ == "__main__":
     assert rep["students"][0]["share"] == round(3000 / 3600, 3)
     # Both stretches shown, so a teacher can see the gap rather than infer it.
     assert len(rep["students"][0]["in_out"]) == 2
+
+    # A lab period in another room must NOT read as 60 absences. Lecture 2 was
+    # analysed (coverage runs to 11:00) and nobody was in the room.
+    [lab] = log.per_lecture([lec2], min_dwell_sec=1800.0)
+    assert lab["state"] == "no_session", lab["state"]
+    assert lab["absent"] == 0, "an idle room must not manufacture absences"
+    assert {s["status"] for s in lab["students"]} == {"no_session"}
+
+    # Beyond where the footage reached is a different claim again: not an empty
+    # room, no observation at all. A607's recordings stop at 12:05.
+    [after] = log.per_lecture(parse_lectures(("15:30-16:30",), DAY))
+    assert after["state"] == "no_data", after["state"]
+    assert after["absent"] == 0
+
+    # And a period that WAS observed with people in it still reports absences.
+    assert rep["state"] == "normal" and rep["absent"] == 1
 
     # Capture time comes off the NVR filename, not the clock or the mtime.
     real = "10.20.30.40_ch5_20260921090256_20260921120411.asf"
