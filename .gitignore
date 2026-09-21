@@ -1,8 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
-data/
+# face crops, the FAISS index and the named attendance reports are biometric
+# records of real students -- they stay off GitHub. Share them out of band.
+# Pinned model weights are the one exception: sourcing them is a trap.
+data/*
+!data/models/
 # ultralytics drops the .pt and its .onnx export in the cwd; the copy the app
-# loads is data/models/yolo11n.onnx, which data/ already covers. Safe to delete.
-yolo11n.pt
-yolo11n.onnx
+# loads is the tracked data/models/yolo11n.onnx. Safe to delete.
+# leading slash: unanchored, these would also match data/models/yolo11n.onnx
+/yolo11n.pt
+/yolo11n.onnx
