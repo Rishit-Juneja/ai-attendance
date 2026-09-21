@@ -115,11 +115,20 @@ class Config:
     # no longer marks you present, which the old "seen in 3 frames" rule did.
     min_dwell_sec: float = 30.0
     # Timetable, as wall-clock spans. Empty = no slicing, and a session is scored
-    # as one block exactly as before. NOT generated hourly: A607's own footage has
-    # the room full at 09:59:56 and empty at 10:30:55, so an on-the-hour boundary
-    # would cut a running lecture in half. Fill these in from the real timetable.
-    #   lectures = ("09:00-10:30", "10:45-12:15")
-    lectures: tuple = ()
+    # as one block exactly as before.
+    #
+    # Hourly, but off the HALF hour — and the footage confirms it: A607 is full at
+    # 09:59:56 and empty at 10:30:55, which is the 09:30 period ending, not a
+    # 10:00 one. Boundaries generated on :00 would have cut every period in half.
+    #
+    # Lunch, free periods and lab slots are not marked because they are not known
+    # yet. They do not need to be: a period nobody attends simply scores everyone
+    # absent, so running a full day and reading off the near-empty periods is how
+    # you find out which ones they are.
+    lectures: tuple = (
+        "09:30-10:30", "10:30-11:30", "11:30-12:30", "12:30-13:30",
+        "13:30-14:30", "14:30-15:30", "15:30-16:30",
+    )
     # Per-lecture bar for being marked present. Distinct from min_dwell_sec below,
     # which is a noise floor ("was in the room" vs "walked past the door"); this
     # one is policy ("attended enough of the lecture to count").
