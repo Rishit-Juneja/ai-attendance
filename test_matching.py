@@ -611,12 +611,14 @@ def test_batched_embeddings_match_the_reference_path():
 
     Skipped when the model or sample photos aren't present.
     """
-    import os
+    from glob import glob
 
-    photo = "data/test_faces/pic1.jpeg"
-    if not os.path.exists(photo):
+    # Any real face photo does; data/test_faces/ is gitignored.
+    photos = sorted(glob("data/test_faces/*.jp*g"))
+    if not photos:
         print("    (skipped: sample photo not available)")
         return
+    photo = photos[0]
 
     import cv2
 

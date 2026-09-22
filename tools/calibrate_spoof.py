@@ -40,7 +40,7 @@ from src.config import DEFAULT_CONFIG, LOGS_DIR
 from src.pipeline import ArcFaceEmbedder
 
 OUT_DIR = LOGS_DIR / "spoof_calibration"
-DEFAULT_URL = "rtsp://CAMERA-IP:554/stream1"
+DEFAULT_URL = "rtsp://CAMERA-IP:554/stream1"   # set yours, or pass --url
 
 
 def _iou(a, b) -> float:

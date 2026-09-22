@@ -150,8 +150,11 @@ def face_to_person(face_bbox: np.ndarray, persons: list[PersonBox]) -> int | Non
 if __name__ == "__main__":
     import sys
     import time
+    from glob import glob
 
-    photos = [f"data/test_faces/pic{i}.jpeg" for i in (1, 3, 4)]
+    # Pass image paths, or drop a few in data/test_faces/ (gitignored — real
+    # faces never belong in the repo). Absent files are skipped below.
+    photos = sys.argv[1:] or sorted(glob("data/test_faces/*.jp*g"))[:3]
     det = PersonDetector()
 
     for path in photos:

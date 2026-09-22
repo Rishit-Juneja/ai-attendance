@@ -20,7 +20,7 @@ python -m src.webapp          # http://127.0.0.1:5000
 Camera stream URL to paste into the Live page:
 
 ```
-rtsp://CAMERA-IP:554/stream1
+rtsp://<camera-ip>:554/stream1
 ```
 
 That path is not cosmetic. `/onvif1`, `/onvif2`, `/11`, `/12`, `/live/ch00_0`,
@@ -28,15 +28,16 @@ That path is not cosmetic. `/onvif1`, `/onvif2`, `/11`, `/12`, `/live/ch00_0`,
 sub-stream**. Only `/stream1` gives 1920x1080. Verify with `ffprobe`, never by
 "it connected so it must be right".
 
-Reaching the camera needs the secondary NIC address — the camera sits on
-192.168.1.0/24 (factory subnet), the LAN is 192.168.0.0/24:
+These cameras often ship on a **factory subnet** that is not the LAN's, so the
+host needs a second address on the camera's subnet before it can be reached at
+all:
 
 ```fish
-sudo nmcli connection modify "Wired connection 1" +ipv4.addresses HOST-IP/24
+sudo nmcli connection modify "<connection>" +ipv4.addresses <host-ip>/24
 ```
 
-This is already applied permanently. Check with `ip -4 addr` — you want both
-HOST-IP and the DHCP 192.168.0.x on `enp6s0`.
+Make it permanent, then check with `ip -4 addr` — you want both that static
+address and the DHCP one on the same interface.
 
 Camera quirks: answers **no** discovery protocol (no ONVIF WS-Discovery, no
 SADP, no DHIP, no XiongMai) — subnet scan is the only way to find it. Its
@@ -812,10 +813,9 @@ because every other target depends on it.
 
 ## 16. The real deployment: 60 students, very small faces
 
-Everything above was built and measured against stills from `data/test_faces`
-and the bedroom camera at CAMERA-IP. **The actual room is different and
-harder**, and the single number that decides success is **face width in
-pixels.**
+Everything above was built and measured against close-range stills and a single
+desk-distance test camera. **The actual room is different and harder**, and the
+single number that decides success is **face width in pixels.**
 
 ### The geometry
 
