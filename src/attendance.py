@@ -222,8 +222,26 @@ class Alert:
 MIN_OBS_BEFORE_UNKNOWN_ALERT = 5
 
 
+def load_roster() -> list[dict]:
+    """
+    Everyone enrolled, as {name, roll}. Empty when there is no gallery yet.
+
+    Absence is a claim about the enrolled roll, not about the session: a student
+    who never appears produces no track, no record and no row, so without this
+    the register can only ever list people it already saw. That is why the
+    dashboard's "absent" counter read 0 for every session ever run.
+    """
+    from .config import GALLERY_META_PATH
+    try:
+        meta = json.loads(Path(GALLERY_META_PATH).read_text())
+    except (OSError, ValueError):
+        return []
+    return [{"name": m.get("name", ""), "roll": str(m.get("roll", ""))}
+            for m in meta if m.get("roll")]
+
+
 class AttendanceLogger:
-    def __init__(self, session_name: str = None, config=None):
+    def __init__(self, session_name: str = None, config=None, roster: list[dict] = None):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_name = session_name or f"session_{ts}"
         self.log_dir = LOGS_DIR / self.session_name
@@ -237,6 +255,10 @@ class AttendanceLogger:
 
         self.records: dict[str, PersonRecord] = {}      # keyed by roll
         self.unresolved: dict[int, Unresolved] = {}     # keyed by track_id
+        # Who COULD have been here, which is not who was. None = not supplied;
+        # read the gallery rather than defaulting to empty, so absence works
+        # without every caller having to remember to pass it.
+        self.roster = load_roster() if roster is None else roster
         # Analysed time span, detections or not. Without it a lecture window that
         # the footage never reached is indistinguishable from one the whole class
         # skipped, and per_lecture() would report both as everybody absent.
@@ -522,10 +544,18 @@ class AttendanceLogger:
 
     def get_summary(self) -> dict:
         confirmed = [r for r in self.records.values() if r.duration_sec >= self.min_dwell_sec]
+        # Enrolled, never seen. Distinct from "brief", which is someone who WAS
+        # here and did not stay long enough -- opposite evidence, opposite fix.
+        missing = [p for p in self.roster if p["roll"] not in self.records]
         return {
             "session": self.session_name,
             "min_dwell_sec": self.min_dwell_sec,
-            "total_enrolled": len(self.records),
+            # The roster when there is one. This used to be len(self.records),
+            # which is people SEEN -- so it rose as the class filled up and a
+            # register could never show more enrolled than present.
+            "total_enrolled": len(self.roster) or len(self.records),
+            "absent": len(missing),
+            "absentees": [{"name": p["name"], "roll": p["roll"]} for p in missing],
             # "Present" now means dwell-confirmed AND in the room, which is what a
             # register means. Seen-but-brief is reported separately rather than
             # being silently counted as attendance.
@@ -773,6 +803,23 @@ if __name__ == "__main__":
 
     assert parse_lectures(("bogus", "09:00-10:00"), DAY) == [lec1], "bad span must be skipped"
     assert parse_lectures(("10:00-09:00",), DAY) == [], "backwards span must be dropped"
+
+    # Absence is measured against the roster, not against who turned up. log has
+    # records for rolls 0001-0003; 0004 and 0005 are enrolled and never seen.
+    log.roster = [{"name": n, "roll": r} for r, n in
+                  [("0001", "Present"), ("0002", "Brief"), ("0003", "Elsewhere"),
+                   ("0004", "Ghost A"), ("0005", "Ghost B")]]
+    s = log.get_summary()
+    assert s["absent"] == 2, s["absent"]
+    assert [a["name"] for a in s["absentees"]] == ["Ghost A", "Ghost B"]
+    assert s["total_enrolled"] == 5, "enrolled is the roster, not the attendees"
+    # Seen-but-brief is NOT absent: opposite evidence, and conflating them tells
+    # a teacher to chase someone who was sitting in front of her.
+    assert "Brief" not in [a["name"] for a in s["absentees"]]
+    # No gallery, no claim. Falling back to the roster-less count keeps a session
+    # run before anyone is enrolled from reporting the whole class absent.
+    log.roster = []
+    assert log.get_summary()["absent"] == 0
 
     import shutil
     shutil.rmtree(log.log_dir, ignore_errors=True)
