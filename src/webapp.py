@@ -583,7 +583,15 @@ _stream_lock = threading.Lock()
 # Extensions OpenCV will open as a file. Anything else is treated as a live
 # source, because a recording and a camera need opposite handling on almost
 # every axis: clock, buffering, timeouts, and what the end of input means.
-_VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv", ".ts")
+#
+# .asf is what this NVR actually exports (h264 in an ASF container) and its
+# absence here was silent: the file fell through to the live branch, so the
+# capture time in the filename was ignored and every lecture was scored against
+# the wall clock — the exact failure recording_start_time() exists to prevent.
+# Running out of footage was also reported as "camera unreachable" instead of
+# closing the session. Add the container, not a special case for this NVR.
+_VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".mpg", ".mpeg", ".wmv",
+                   ".flv", ".ts", ".asf")
 
 
 def _is_recording(url: str) -> bool:
