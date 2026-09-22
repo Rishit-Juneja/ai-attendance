@@ -49,7 +49,18 @@ PROFILES = {
         # ship it. Display stays at camera rate locally; BoxGlide carries the
         # overlay between analyses.
         analysis_fps=3,
-        det_size=(640, 640),
+        # 640 until real classroom footage was measured on 2026-09-22. On this
+        # project's close-range photos 640 -> 1280 bought 2 usable faces for +43%
+        # time and was rejected; at the actual A607 seating geometry it buys
+        # 63 -> 93 usable faces across 5 frames (+50%) for +105% detect time.
+        # The earlier measurement was not wrong, it was taken at the wrong
+        # distance — SCRFD's pyramid finds a 40px face at 640 easily, and these
+        # are 25-40px. 1920 adds nothing over 1280 for another 2x, so the gain
+        # stops here rather than continuing.
+        #
+        # Cost on the RTX 5060: 70-97ms per frame against a 333ms budget at 3fps.
+        # The 'demo' GTX 1650 profile is 3-4x slower and deliberately NOT raised.
+        det_size=(1280, 1280),
         det_batch=4,
         emb_batch=32,
         max_faces_per_frame=200,
